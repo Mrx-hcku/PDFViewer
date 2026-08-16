@@ -176,6 +176,9 @@ public class MainActivity extends AppCompatActivity {
             }
 
             @Override
+            public void onBannerShown(BannerView bannerAdView) {}
+
+            @Override
             public void onBannerClick(BannerView bannerAdView) {}
 
             @Override
@@ -338,4 +341,4 @@ public class MainActivity extends AppCompatActivity {
             }
         }
     }
-            }
+}
