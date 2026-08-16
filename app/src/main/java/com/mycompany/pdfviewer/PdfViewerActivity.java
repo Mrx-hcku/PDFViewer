@@ -5,8 +5,11 @@ import android.graphics.Bitmap;
 import android.graphics.pdf.PdfRenderer;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.ParcelFileDescriptor;
 import android.text.InputType;
+import android.util.LruCache;
 import android.view.LayoutInflater;
 import android.view.Menu;
 import android.view.MenuItem;
@@ -23,8 +26,8 @@ import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class PdfViewerActivity extends AppCompatActivity {
 
@@ -33,7 +36,15 @@ public class PdfViewerActivity extends AppCompatActivity {
     private LinearLayoutManager layoutManager;
     private PdfRenderer pdfRenderer;
     private ParcelFileDescriptor fileDescriptor;
-    private List<Bitmap> pageBitmaps = new ArrayList<>();
+    private int pageCount = 0;
+    private int[] pageHeights; // pre-computed display height per page (width-fitted)
+    private int screenWidth;
+
+    private final ExecutorService renderExecutor = Executors.newSingleThreadExecutor();
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private LruCache<Integer, Bitmap> bitmapCache;
+    private final Object rendererLock = new Object();
+    private volatile boolean destroyed = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -49,16 +60,33 @@ public class PdfViewerActivity extends AppCompatActivity {
         layoutManager = new LinearLayoutManager(this);
         pageList.setLayoutManager(layoutManager);
 
+        screenWidth = getResources().getDisplayMetrics().widthPixels;
+
+        // Cache size: keep only a handful of pages in memory at once
+        long maxMemory = Runtime.getRuntime().maxMemory() / 1024;
+        int cacheSize = (int) (maxMemory / 16); // ~1/16th of available memory, in KB
+        bitmapCache = new LruCache<Integer, Bitmap>(cacheSize) {
+            @Override
+            protected int sizeOf(Integer key, Bitmap bitmap) {
+                return bitmap.getByteCount() / 1024;
+            }
+
+            @Override
+            protected void entryRemoved(boolean evicted, Integer key, Bitmap oldValue, Bitmap newValue) {
+                if (oldValue != null && !oldValue.isRecycled()) oldValue.recycle();
+            }
+        };
+
         pageList.addOnScrollListener(new RecyclerView.OnScrollListener() {
             @Override
             public void onScrolled(@NonNull RecyclerView rv, int dx, int dy) {
                 int pos = layoutManager.findFirstVisibleItemPosition();
-                if (pos >= 0) pageIndicator.setText((pos + 1) + "/" + pageBitmaps.size());
+                if (pos >= 0) pageIndicator.setText((pos + 1) + "/" + pageCount);
             }
         });
 
         String uriString = getIntent().getStringExtra("pdf_uri");
-        if (uriString != null) loadPdf(Uri.parse(uriString));
+        if (uriString != null) openPdf(Uri.parse(uriString));
     }
 
     @Override
@@ -79,12 +107,12 @@ public class PdfViewerActivity extends AppCompatActivity {
         EditText input = new EditText(this);
         input.setInputType(InputType.TYPE_CLASS_NUMBER);
         new AlertDialog.Builder(this)
-                .setTitle("Jump to page (1-" + pageBitmaps.size() + ")")
+                .setTitle("Jump to page (1-" + pageCount + ")")
                 .setView(input)
                 .setPositiveButton("Go", (dialog, which) -> {
                     try {
                         int page = Integer.parseInt(input.getText().toString()) - 1;
-                        if (page >= 0 && page < pageBitmaps.size())
+                        if (page >= 0 && page < pageCount)
                             pageList.smoothScrollToPosition(page);
                     } catch (Exception ignored) {}
                 })
@@ -92,33 +120,88 @@ public class PdfViewerActivity extends AppCompatActivity {
                 .show();
     }
 
-    private void loadPdf(Uri uri) {
-        try {
-            fileDescriptor = getContentResolver().openFileDescriptor(uri, "r");
-            if (fileDescriptor == null) return;
-            pdfRenderer = new PdfRenderer(fileDescriptor);
-            int count = pdfRenderer.getPageCount();
-            for (int i = 0; i < count; i++) {
-                PdfRenderer.Page page = pdfRenderer.openPage(i);
-                Bitmap bitmap = Bitmap.createBitmap(page.getWidth() * 2, page.getHeight() * 2, Bitmap.Config.ARGB_8888);
-                page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
-                pageBitmaps.add(bitmap);
-                page.close();
+    private void openPdf(Uri uri) {
+        renderExecutor.execute(() -> {
+            try {
+                ParcelFileDescriptor fd = getContentResolver().openFileDescriptor(uri, "r");
+                if (fd == null) return;
+                synchronized (rendererLock) {
+                    fileDescriptor = fd;
+                    pdfRenderer = new PdfRenderer(fileDescriptor);
+                    pageCount = pdfRenderer.getPageCount();
+                    pageHeights = new int[pageCount];
+                    for (int i = 0; i < pageCount; i++) {
+                        PdfRenderer.Page page = pdfRenderer.openPage(i);
+                        float ratio = (float) page.getHeight() / page.getWidth();
+                        pageHeights[i] = Math.round(screenWidth * ratio);
+                        page.close();
+                    }
+                }
+                mainHandler.post(() -> {
+                    if (destroyed) return;
+                    pageList.setAdapter(new PdfPageAdapter());
+                    pageIndicator.setText("1/" + pageCount);
+                });
+            } catch (Exception e) {
+                mainHandler.post(() -> {
+                    if (!destroyed) {
+                        Toast.makeText(PdfViewerActivity.this,
+                                "Failed to open PDF: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                    }
+                });
             }
-            pageList.setAdapter(new PdfPageAdapter());
-            pageIndicator.setText("1/" + pageBitmaps.size());
-        } catch (IOException e) {
-            Toast.makeText(this, "Failed to open PDF: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        });
+    }
+
+    private void renderPage(int position, ZoomableImageView imageView) {
+        Bitmap cached = bitmapCache.get(position);
+        if (cached != null && !cached.isRecycled()) {
+            imageView.setImageBitmap(cached);
+            return;
         }
+        imageView.setImageBitmap(null);
+        imageView.setTag(position);
+
+        renderExecutor.execute(() -> {
+            if (destroyed) return;
+            Bitmap bitmap;
+            synchronized (rendererLock) {
+                if (pdfRenderer == null || destroyed) return;
+                try {
+                    PdfRenderer.Page page = pdfRenderer.openPage(position);
+                    bitmap = Bitmap.createBitmap(screenWidth, pageHeights[position], Bitmap.Config.ARGB_8888);
+                    bitmap.eraseColor(0xFFFFFFFF);
+                    page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
+                    page.close();
+                } catch (Exception e) {
+                    return;
+                }
+            }
+            bitmapCache.put(position, bitmap);
+            Bitmap finalBitmap = bitmap;
+            mainHandler.post(() -> {
+                if (destroyed) return;
+                if (imageView.getTag() != null && (int) imageView.getTag() == position) {
+                    imageView.setImageBitmap(finalBitmap);
+                }
+            });
+        });
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        try {
-            if (pdfRenderer != null) pdfRenderer.close();
-            if (fileDescriptor != null) fileDescriptor.close();
-        } catch (IOException ignored) {}
+        destroyed = true;
+        renderExecutor.execute(() -> {
+            synchronized (rendererLock) {
+                try {
+                    if (pdfRenderer != null) pdfRenderer.close();
+                    if (fileDescriptor != null) fileDescriptor.close();
+                } catch (IOException ignored) {}
+            }
+        });
+        renderExecutor.shutdown();
+        bitmapCache.evictAll();
     }
 
     private class PdfPageAdapter extends RecyclerView.Adapter<PdfPageAdapter.VH> {
@@ -132,12 +215,21 @@ public class PdfViewerActivity extends AppCompatActivity {
 
         @Override
         public void onBindViewHolder(@NonNull VH holder, int position) {
-            holder.image.setImageBitmap(pageBitmaps.get(position));
+            ViewGroup.LayoutParams lp = holder.image.getLayoutParams();
+            lp.height = pageHeights[position];
+            holder.image.setLayoutParams(lp);
+            renderPage(position, holder.image);
+        }
+
+        @Override
+        public void onViewRecycled(@NonNull VH holder) {
+            super.onViewRecycled(holder);
+            holder.image.setTag(null);
         }
 
         @Override
         public int getItemCount() {
-            return pageBitmaps.size();
+            return pageCount;
         }
 
         class VH extends RecyclerView.ViewHolder {
