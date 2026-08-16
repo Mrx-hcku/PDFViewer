@@ -26,7 +26,8 @@
             android:background="#EEEEEE"
             android:hint="Search PDFs"
             android:inputType="text"
-            android:singleLine="true" />
+            android:singleLine="true"
+            android:visibility="gone" />
 
         <TextView
             android:id="@+id/emptyText"
@@ -49,6 +50,6 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:gravity="center"
-            android:background="#F5F5F5" />
+            android:visibility="gone" />
     </LinearLayout>
 </androidx.coordinatorlayout.widget.CoordinatorLayout>
