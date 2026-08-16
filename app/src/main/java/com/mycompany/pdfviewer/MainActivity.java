@@ -16,6 +16,7 @@ import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.TextView;
@@ -60,7 +61,10 @@ public class MainActivity extends AppCompatActivity {
     private RecyclerView recyclerView;
     private TextView emptyText;
     private EditText searchBox;
+    private FrameLayout bannerContainer;
     private BannerView bannerView;
+    private boolean searchVisible = false;
+
     private final Handler adHandler = new Handler(Looper.getMainLooper());
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService scanExecutor = Executors.newSingleThreadExecutor();
@@ -86,6 +90,7 @@ public class MainActivity extends AppCompatActivity {
         recyclerView = findViewById(R.id.recentList);
         emptyText = findViewById(R.id.emptyText);
         searchBox = findViewById(R.id.searchBox);
+        bannerContainer = findViewById(R.id.bannerContainer);
         recyclerView.setLayoutManager(new LinearLayoutManager(this));
         recyclerView.setAdapter(new PdfAdapter());
 
@@ -143,7 +148,7 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    // ---------- Background scan (no more UI freeze) ----------
+    // ---------- Background scan ----------
 
     private void scanDevice() {
         if (scanning) return;
@@ -181,6 +186,23 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    // ---------- Search toggle ----------
+
+    private void toggleSearch() {
+        searchVisible = !searchVisible;
+        if (searchVisible) {
+            searchBox.setVisibility(View.VISIBLE);
+            searchBox.requestFocus();
+            InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+            if (imm != null) imm.showSoftInput(searchBox, InputMethodManager.SHOW_IMPLICIT);
+        } else {
+            searchBox.setText("");
+            searchBox.setVisibility(View.GONE);
+            InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+            if (imm != null) imm.hideSoftInputFromWindow(searchBox.getWindowToken(), 0);
+        }
+    }
+
     // ---------- Ads ----------
 
     private void initAds() {
@@ -200,13 +222,14 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void loadBanner() {
-        FrameLayout container = findViewById(R.id.bannerContainer);
         bannerView = new BannerView(this, BANNER_PLACEMENT, new UnityBannerSize(320, 50));
         bannerView.setListener(new BannerView.IListener() {
             @Override
             public void onBannerLoaded(BannerView bannerAdView) {
-                runOnUiThread(() -> Toast.makeText(MainActivity.this,
-                        "Welcome to the app!", Toast.LENGTH_SHORT).show());
+                runOnUiThread(() -> {
+                    bannerContainer.setVisibility(View.VISIBLE);
+                    Toast.makeText(MainActivity.this, "Welcome to the app!", Toast.LENGTH_SHORT).show();
+                });
             }
 
             @Override
@@ -218,12 +241,13 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onBannerFailedToLoad(BannerView bannerAdView, BannerErrorInfo errorInfo) {
                 Log.e(TAG, "Banner failed: [" + errorInfo.errorCode + "] " + errorInfo.errorMessage);
+                runOnUiThread(() -> bannerContainer.setVisibility(View.GONE));
             }
 
             @Override
             public void onBannerLeftApplication(BannerView bannerAdView) {}
         });
-        container.addView(bannerView);
+        bannerContainer.addView(bannerView);
         bannerView.load();
     }
 
@@ -321,7 +345,12 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     public boolean onOptionsItemSelected(MenuItem item) {
-        if (item.getItemId() == R.id.action_watch_ad) {
+        int id = item.getItemId();
+        if (id == R.id.action_search) {
+            toggleSearch();
+            return true;
+        }
+        if (id == R.id.action_watch_ad) {
             showRewardedAd();
             return true;
         }
