@@ -11,29 +11,20 @@
         android:elevation="4dp"
         android:titleTextColor="@android:color/white" />
 
-    <androidx.viewpager2.widget.ViewPager2
-        android:id="@+id/viewPager"
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/pageList"
         android:layout_width="match_parent"
         android:layout_height="0dp"
-        android:layout_weight="1" />
+        android:layout_weight="1"
+        android:background="#DDDDDD"
+        android:clipToPadding="false"
+        android:paddingTop="4dp"
+        android:paddingBottom="4dp" />
 
-    <LinearLayout
+    <TextView android:id="@+id/pageIndicator"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:padding="8dp"
-        android:gravity="center_vertical">
-
-        <TextView android:id="@+id/pageIndicator"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginEnd="8dp"
-            android:text="1/1" />
-
-        <SeekBar android:id="@+id/pageSeekBar"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:max="0" />
-    </LinearLayout>
+        android:gravity="center"
+        android:padding="6dp"
+        android:text="1/1" />
 </LinearLayout>
