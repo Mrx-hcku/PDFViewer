@@ -1,6 +1,6 @@
 <menu xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto">
-    <item android:id="@+id/action_jump"
-        android:title="Jump to Page"
+    <item android:id="@+id/action_watch_ad"
+        android:title="Support Us (Watch Ad)"
         app:showAsAction="never" />
 </menu>
