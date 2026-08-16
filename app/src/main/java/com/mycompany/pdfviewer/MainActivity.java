@@ -5,9 +5,12 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.Settings;
 import android.text.Editable;
 import android.text.TextWatcher;
+import android.util.Log;
 import android.view.LayoutInflater;
 import android.view.Menu;
 import android.view.MenuItem;
@@ -37,9 +40,12 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class MainActivity extends AppCompatActivity {
 
+    private static final String TAG = "PdfViewerAds";
     private static final int REQ_MANAGE_STORAGE = 400;
 
     private static final String GAME_ID = "800356656";
@@ -48,11 +54,23 @@ public class MainActivity extends AppCompatActivity {
     private static final String INTERSTITIAL_PLACEMENT = "Interstitial_Android";
     private static final String REWARDED_PLACEMENT = "Rewarded_Android";
 
+    private static final int MAX_RETRIES = 3;
+    private static final long[] RETRY_DELAYS_MS = {5000, 15000, 30000};
+
     private RecyclerView recyclerView;
     private TextView emptyText;
     private EditText searchBox;
     private BannerView bannerView;
+    private final Handler adHandler = new Handler(Looper.getMainLooper());
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final ExecutorService scanExecutor = Executors.newSingleThreadExecutor();
+    private volatile boolean scanning = false;
+    private boolean destroyed = false;
+
     private boolean rewardedReady = false;
+    private boolean interstitialReady = false;
+    private int rewardedRetryCount = 0;
+    private int interstitialRetryCount = 0;
 
     private List<String[]> allPdfs = new ArrayList<>();
     private List<String[]> filteredPdfs = new ArrayList<>();
@@ -69,6 +87,7 @@ public class MainActivity extends AppCompatActivity {
         emptyText = findViewById(R.id.emptyText);
         searchBox = findViewById(R.id.searchBox);
         recyclerView.setLayoutManager(new LinearLayoutManager(this));
+        recyclerView.setAdapter(new PdfAdapter());
 
         searchBox.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
@@ -85,7 +104,7 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onResume() {
         super.onResume();
-        if (hasStoragePermission()) scanDevice();
+        if (hasStoragePermission() && !scanning) scanDevice();
     }
 
     private boolean hasStoragePermission() {
@@ -124,15 +143,29 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    // ---------- Background scan (no more UI freeze) ----------
+
     private void scanDevice() {
+        if (scanning) return;
+        scanning = true;
         emptyText.setOnClickListener(null);
-        allPdfs.clear();
-        File root = Environment.getExternalStorageDirectory();
-        scanRecursive(root, 0);
-        filterList(searchBox.getText().toString());
+
+        scanExecutor.execute(() -> {
+            List<String[]> results = new ArrayList<>();
+            File root = Environment.getExternalStorageDirectory();
+            scanRecursive(root, 0, results);
+
+            if (destroyed) return;
+            mainHandler.post(() -> {
+                if (destroyed) return;
+                allPdfs = results;
+                scanning = false;
+                filterList(searchBox.getText().toString());
+            });
+        });
     }
 
-    private void scanRecursive(File dir, int depth) {
+    private void scanRecursive(File dir, int depth, List<String[]> results) {
         if (dir == null || !dir.isDirectory() || depth > 12) return;
         File[] files = dir.listFiles();
         if (files == null) return;
@@ -140,13 +173,15 @@ public class MainActivity extends AppCompatActivity {
         for (File f : files) {
             if (f.isDirectory()) {
                 if (f.isHidden()) continue;
-                scanRecursive(f, depth + 1);
+                scanRecursive(f, depth + 1, results);
             } else if (f.getName().toLowerCase(Locale.ROOT).endsWith(".pdf")) {
                 String date = sdf.format(new Date(f.lastModified()));
-                allPdfs.add(new String[]{Uri.fromFile(f).toString(), f.getName(), date});
+                results.add(new String[]{Uri.fromFile(f).toString(), f.getName(), date});
             }
         }
     }
+
+    // ---------- Ads ----------
 
     private void initAds() {
         UnityAds.initialize(this, GAME_ID, TEST_MODE, new IUnityAdsInitializationListener() {
@@ -159,8 +194,7 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public void onInitializationFailed(UnityAds.UnityAdsInitializationError error, String message) {
-                runOnUiThread(() -> Toast.makeText(MainActivity.this,
-                        "Ad init failed: " + error + " - " + message, Toast.LENGTH_LONG).show());
+                Log.e(TAG, "Ad init failed: " + error + " - " + message);
             }
         });
     }
@@ -183,9 +217,7 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public void onBannerFailedToLoad(BannerView bannerAdView, BannerErrorInfo errorInfo) {
-                runOnUiThread(() -> Toast.makeText(MainActivity.this,
-                        "Ad failed to load: [" + errorInfo.errorCode + "] " + errorInfo.errorMessage,
-                        Toast.LENGTH_LONG).show());
+                Log.e(TAG, "Banner failed: [" + errorInfo.errorCode + "] " + errorInfo.errorMessage);
             }
 
             @Override
@@ -198,14 +230,28 @@ public class MainActivity extends AppCompatActivity {
     private void loadInterstitial() {
         UnityAds.load(INTERSTITIAL_PLACEMENT, new IUnityAdsLoadListener() {
             @Override
-            public void onUnityAdsAdLoaded(String placementId) {}
+            public void onUnityAdsAdLoaded(String placementId) {
+                interstitialReady = true;
+                interstitialRetryCount = 0;
+            }
 
             @Override
             public void onUnityAdsFailedToLoad(String placementId, UnityAds.UnityAdsLoadError error, String message) {
-                runOnUiThread(() -> Toast.makeText(MainActivity.this,
-                        "Interstitial load failed: [" + error + "] " + message, Toast.LENGTH_LONG).show());
+                interstitialReady = false;
+                Log.e(TAG, "Interstitial failed: [" + error + "] " + message);
+                retryInterstitial();
             }
         });
+    }
+
+    private void retryInterstitial() {
+        if (interstitialRetryCount >= MAX_RETRIES) {
+            interstitialRetryCount = 0;
+            return;
+        }
+        long delay = RETRY_DELAYS_MS[interstitialRetryCount];
+        interstitialRetryCount++;
+        adHandler.postDelayed(this::loadInterstitial, delay);
     }
 
     private void loadRewarded() {
@@ -214,28 +260,40 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onUnityAdsAdLoaded(String placementId) {
                 rewardedReady = true;
+                rewardedRetryCount = 0;
             }
 
             @Override
             public void onUnityAdsFailedToLoad(String placementId, UnityAds.UnityAdsLoadError error, String message) {
                 rewardedReady = false;
-                runOnUiThread(() -> Toast.makeText(MainActivity.this,
-                        "Rewarded ad load failed: [" + error + "] " + message, Toast.LENGTH_LONG).show());
+                Log.e(TAG, "Rewarded failed: [" + error + "] " + message);
+                retryRewarded();
             }
         });
     }
 
+    private void retryRewarded() {
+        if (rewardedRetryCount >= MAX_RETRIES) {
+            rewardedRetryCount = 0;
+            return;
+        }
+        long delay = RETRY_DELAYS_MS[rewardedRetryCount];
+        rewardedRetryCount++;
+        adHandler.postDelayed(this::loadRewarded, delay);
+    }
+
     private void showRewardedAd() {
         if (!rewardedReady) {
-            Toast.makeText(this, "Ad not ready yet, try again in a moment", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "Please try again in a moment", Toast.LENGTH_SHORT).show();
+            rewardedRetryCount = 0;
             loadRewarded();
             return;
         }
         UnityAds.show(this, REWARDED_PLACEMENT, new IUnityAdsShowListener() {
             @Override
             public void onUnityAdsShowFailure(String placementId, UnityAds.UnityAdsShowError error, String message) {
-                runOnUiThread(() -> Toast.makeText(MainActivity.this,
-                        "Ad show failed: [" + error + "] " + message, Toast.LENGTH_LONG).show());
+                Log.e(TAG, "Rewarded show failed: [" + error + "] " + message);
+                rewardedReady = false;
             }
             @Override public void onUnityAdsShowStart(String placementId) {}
             @Override public void onUnityAdsShowClick(String placementId) {}
@@ -244,14 +302,16 @@ public class MainActivity extends AppCompatActivity {
                 runOnUiThread(() -> {
                     if (state == UnityAds.UnityAdsShowCompletionState.COMPLETED) {
                         Toast.makeText(MainActivity.this, "Thanks for your support!", Toast.LENGTH_SHORT).show();
-                    } else {
-                        Toast.makeText(MainActivity.this, "Ad skipped, no reward given", Toast.LENGTH_SHORT).show();
                     }
                 });
+                rewardedReady = false;
+                rewardedRetryCount = 0;
                 loadRewarded();
             }
         });
     }
+
+    // ---------- Menu ----------
 
     @Override
     public boolean onCreateOptionsMenu(Menu menu) {
@@ -268,6 +328,8 @@ public class MainActivity extends AppCompatActivity {
         return super.onOptionsItemSelected(item);
     }
 
+    // ---------- List ----------
+
     private void filterList(String query) {
         filteredPdfs.clear();
         for (String[] item : allPdfs) {
@@ -280,13 +342,18 @@ public class MainActivity extends AppCompatActivity {
             emptyText.setVisibility(filteredPdfs.isEmpty() ? View.VISIBLE : View.GONE);
             emptyText.setText(allPdfs.isEmpty() ? "No PDFs found on device." : "No matching PDFs found.");
         }
-        recyclerView.setAdapter(new PdfAdapter());
+        recyclerView.getAdapter().notifyDataSetChanged();
     }
 
     private void openViewer(Uri uri) {
+        if (!interstitialReady) {
+            navigateToViewer(uri);
+            return;
+        }
         UnityAds.show(this, INTERSTITIAL_PLACEMENT, new IUnityAdsShowListener() {
             @Override
             public void onUnityAdsShowFailure(String placementId, UnityAds.UnityAdsShowError error, String message) {
+                Log.e(TAG, "Interstitial show failed: [" + error + "] " + message);
                 navigateToViewer(uri);
             }
             @Override public void onUnityAdsShowStart(String placementId) {}
@@ -294,6 +361,8 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onUnityAdsShowComplete(String placementId, UnityAds.UnityAdsShowCompletionState state) {
                 navigateToViewer(uri);
+                interstitialReady = false;
+                interstitialRetryCount = 0;
                 loadInterstitial();
             }
         });
@@ -308,6 +377,10 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        destroyed = true;
+        adHandler.removeCallbacksAndMessages(null);
+        mainHandler.removeCallbacksAndMessages(null);
+        scanExecutor.shutdownNow();
         if (bannerView != null) bannerView.destroy();
     }
 
@@ -341,4 +414,4 @@ public class MainActivity extends AppCompatActivity {
             }
         }
     }
-}
+    }
