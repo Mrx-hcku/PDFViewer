@@ -48,9 +48,9 @@ public class PdfViewerActivity extends AppCompatActivity {
     private PdfRenderer pdfRenderer;
     private ParcelFileDescriptor fileDescriptor;
     private int pageCount = 0;
-    private int[] pageHeights; // display height per page (width-fitted, unscaled)
+    private int[] pageHeights; 
     private int screenWidth;
-    private static final int RENDER_SCALE = 2; // supersample so pinch-zoom stays sharp
+    private static final int RENDER_SCALE = 1; // Memory optimization for large PDFs
 
     private Uri currentUri;
     private boolean nightMode = false;
@@ -214,7 +214,7 @@ public class PdfViewerActivity extends AppCompatActivity {
                 if (destroyed) return;
                 progress.dismiss();
                 if (resultPage != null) {
-                    pageList.smoothScrollToPosition(resultPage);
+                    pageList.scrollToPosition(resultPage);
                     Toast.makeText(PdfViewerActivity.this, "Found on page " + (resultPage + 1), Toast.LENGTH_SHORT).show();
                 } else {
                     Toast.makeText(PdfViewerActivity.this, "Not found in this PDF", Toast.LENGTH_SHORT).show();
@@ -274,7 +274,8 @@ public class PdfViewerActivity extends AppCompatActivity {
                     PdfRenderer.Page page = pdfRenderer.openPage(position);
                     int w = screenWidth * RENDER_SCALE;
                     int h = pageHeights[position] * RENDER_SCALE;
-                    bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+                    // Using RGB_565 to completely avoid OutOfMemory crashes on large PDFs
+                    bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.RGB_565);
                     bitmap.eraseColor(0xFFFFFFFF);
                     page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
                     page.close();
@@ -346,4 +347,5 @@ public class PdfViewerActivity extends AppCompatActivity {
             }
         }
     }
-}
+        }
+    
