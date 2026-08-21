@@ -48,9 +48,9 @@ public class PdfViewerActivity extends AppCompatActivity {
     private PdfRenderer pdfRenderer;
     private ParcelFileDescriptor fileDescriptor;
     private int pageCount = 0;
-    private int[] pageHeights; 
+    private int[] pageHeights; // display height per page (width-fitted, unscaled)
     private int screenWidth;
-    private static final int RENDER_SCALE = 1; // Memory optimization for large PDFs
+    private static final int RENDER_SCALE = 2; // supersample so pinch-zoom stays sharp
 
     private Uri currentUri;
     private boolean nightMode = false;
@@ -214,7 +214,7 @@ public class PdfViewerActivity extends AppCompatActivity {
                 if (destroyed) return;
                 progress.dismiss();
                 if (resultPage != null) {
-                    pageList.scrollToPosition(resultPage);
+                    pageList.smoothScrollToPosition(resultPage);
                     Toast.makeText(PdfViewerActivity.this, "Found on page " + (resultPage + 1), Toast.LENGTH_SHORT).show();
                 } else {
                     Toast.makeText(PdfViewerActivity.this, "Not found in this PDF", Toast.LENGTH_SHORT).show();
@@ -267,21 +267,35 @@ public class PdfViewerActivity extends AppCompatActivity {
 
         renderExecutor.execute(() -> {
             if (destroyed) return;
-            Bitmap bitmap;
+            Bitmap bitmap = null;
             synchronized (rendererLock) {
                 if (pdfRenderer == null || destroyed) return;
+                int w = screenWidth * RENDER_SCALE;
+                int h = pageHeights[position] * RENDER_SCALE;
                 try {
-                    PdfRenderer.Page page = pdfRenderer.openPage(position);
-                    int w = screenWidth * RENDER_SCALE;
-                    int h = pageHeights[position] * RENDER_SCALE;
-                    // Using RGB_565 to completely avoid OutOfMemory crashes on large PDFs
-                    bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.RGB_565);
-                    bitmap.eraseColor(0xFFFFFFFF);
-                    page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
-                    page.close();
+                    bitmap = renderAtSize(position, w, h);
+                } catch (OutOfMemoryError oom) {
+                    // Fall back to native (1x) resolution if the supersampled
+                    // bitmap doesn't fit in memory — better a slightly softer
+                    // zoom than a crash on large/high-res PDFs.
+                    System.gc();
+                    try {
+                        bitmap = renderAtSize(position, screenWidth, pageHeights[position]);
+                    } catch (OutOfMemoryError oom2) {
+                        bitmap = null;
+                    } catch (Exception ignored) {
+                        bitmap = null;
+                    }
                 } catch (Exception e) {
-                    return;
+                    bitmap = null;
                 }
+            }
+            if (bitmap == null) {
+                mainHandler.post(() -> {
+                    if (!destroyed) Toast.makeText(PdfViewerActivity.this,
+                            "Page " + (position + 1) + " ke liye memory kam pad gayi", Toast.LENGTH_SHORT).show();
+                });
+                return;
             }
             bitmapCache.put(position, bitmap);
             Bitmap finalBitmap = bitmap;
@@ -292,6 +306,20 @@ public class PdfViewerActivity extends AppCompatActivity {
                 }
             });
         });
+    }
+
+    /** Must be called while holding rendererLock. */
+    private Bitmap renderAtSize(int position, int w, int h) throws Exception {
+        PdfRenderer.Page page = pdfRenderer.openPage(position);
+        try {
+            // RGB_565 halves memory vs ARGB_8888 — PDF pages are opaque, no alpha needed.
+            Bitmap bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.RGB_565);
+            bitmap.eraseColor(0xFFFFFFFF);
+            page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
+            return bitmap;
+        } finally {
+            page.close();
+        }
     }
 
     @Override
@@ -347,5 +375,4 @@ public class PdfViewerActivity extends AppCompatActivity {
             }
         }
     }
-        }
-    
+    }
