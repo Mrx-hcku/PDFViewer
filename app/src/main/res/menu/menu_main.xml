@@ -11,5 +11,5 @@
     <item 
         android:id="@+id/action_watch_ad"
         android:title="Watch Ad"
-        app:showAsAction="never" />
+        app:showAsAction="support us" />
 </menu>
