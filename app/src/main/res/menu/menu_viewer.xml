@@ -1,0 +1,13 @@
+<menu xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+    <item android:id="@+id/action_jump"
+        android:title="Jump to Page"
+        app:showAsAction="never" />
+    <item android:id="@+id/action_search_text"
+        android:title="Search in PDF"
+        app:showAsAction="never" />
+    <item android:id="@+id/action_night_mode"
+        android:title="Night Mode"
+        android:checkable="true"
+        app:showAsAction="never" />
+</menu>
