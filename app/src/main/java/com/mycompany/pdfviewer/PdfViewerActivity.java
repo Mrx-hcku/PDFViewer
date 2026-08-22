@@ -2,15 +2,20 @@ package com.mycompany.pdfviewer;
 
 import android.app.AlertDialog;
 import android.app.ProgressDialog;
+import android.content.ContentValues;
 import android.content.Intent;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.MediaStore;
 import android.text.InputType;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.widget.EditText;
+import android.widget.LinearLayout;
 import android.widget.Toast;
 
 import androidx.appcompat.app.AppCompatActivity;
@@ -22,18 +27,28 @@ import com.tom_roush.pdfbox.android.PDFBoxResourceLoader;
 import com.tom_roush.pdfbox.pdmodel.PDDocument;
 import com.tom_roush.pdfbox.text.PDFTextStripper;
 
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+import okhttp3.MediaType;
+import okhttp3.MultipartBody;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
 
 public class PdfViewerActivity extends AppCompatActivity {
 
     private PDFView pdfView;
     private Uri currentUri;
     private int pageCount = 0;
-    private int currentRadicales = 0; // Error fixed here
 
     private final ExecutorService searchExecutor = Executors.newSingleThreadExecutor();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -108,6 +123,7 @@ public class PdfViewerActivity extends AppCompatActivity {
         if (id == android.R.id.home) { finish(); return true; }
         if (id == R.id.action_jump) { showJumpDialog(); return true; }
         if (id == R.id.action_search_text) { showSearchDialog(); return true; }
+        if (id == R.id.action_edit_pdf) { showEditPdfDialog(); return true; }
         return super.onOptionsItemSelected(item);
     }
 
@@ -139,10 +155,153 @@ public class PdfViewerActivity extends AppCompatActivity {
                 .setView(input)
                 .setPositiveButton("Search", (dialog, which) -> {
                     String query = input.getText().toString().trim();
-                    if (query.length() > 0) runTextSearch(query);
+                    if (!query.isEmpty()) runTextSearch(query);
                 })
                 .setNegativeButton("Cancel", null)
                 .show();
+    }
+
+    private void showEditPdfDialog() {
+        if (currentUri == null) return;
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(50, 40, 50, 10);
+
+        final EditText targetInput = new EditText(this);
+        targetInput.setHint("Target text to replace");
+        layout.addView(targetInput);
+
+        final EditText newInput = new EditText(this);
+        newInput.setHint("New replacement text");
+        layout.addView(newInput);
+
+        new AlertDialog.Builder(this)
+                .setTitle("Edit PDF via Cloud")
+                .setView(layout)
+                .setPositiveButton("Update", (dialog, which) -> {
+                    String targetText = targetInput.getText().toString().trim();
+                    String newText = newInput.getText().toString().trim();
+                    if (!targetText.isEmpty() && !newText.isEmpty()) {
+                        uploadAndEditPdf(targetText, newText);
+                    } else {
+                        Toast.makeText(this, "Both fields are required", Toast.LENGTH_SHORT).show();
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void uploadAndEditPdf(String targetText, String newText) {
+        final ProgressDialog progress = new ProgressDialog(this);
+        progress.setMessage("Editing PDF on cloud...");
+        progress.setCancelable(false);
+        progress.show();
+
+        searchExecutor.execute(() -> {
+            try {
+                InputStream inputStream = getContentResolver().openInputStream(currentUri);
+                if (inputStream == null) {
+                    mainHandler.post(() -> {
+                        progress.dismiss();
+                        Toast.makeText(this, "Failed to read PDF file", Toast.LENGTH_SHORT).show();
+                    });
+                    return;
+                }
+
+                File tempFile = new File(getCacheDir(), "upload_temp.pdf");
+                try (OutputStream outputStream = new FileOutputStream(tempFile)) {
+                    byte[] buffer = new byte[4096];
+                    int bytesRead;
+                    while ((bytesRead = inputStream.read(buffer)) != -1) {
+                        outputStream.write(buffer, 0, bytesRead);
+                    }
+                }
+                inputStream.close();
+
+                OkHttpClient client = new OkHttpClient.Builder()
+                        .connectTimeout(60, TimeUnit.SECONDS)
+                        .writeTimeout(60, TimeUnit.SECONDS)
+                        .readTimeout(60, TimeUnit.SECONDS)
+                        .build();
+
+                RequestBody requestBody = new MultipartBody.Builder()
+                        .setType(MultipartBody.FORM)
+                        .addFormDataPart("targetText", targetText)
+                        .addFormDataPart("newText", newText)
+                        .addFormDataPart("pdf", tempFile.getName(),
+                                RequestBody.create(tempFile, MediaType.parse("application/pdf")))
+                        .build();
+
+                Request request = new Request.Builder()
+                        .url("https://pdf-backend-2-d94s.onrender.com/edit-pdf")
+                        .post(requestBody)
+                        .build();
+
+                try (Response response = client.newCall(request).execute()) {
+                    if (response.isSuccessful() && response.body() != null) {
+                        String fileName = "edited_" + System.currentTimeMillis() + ".pdf";
+                        File cacheFile = new File(getCacheDir(), fileName);
+
+                        // Save to cache for immediate viewing inside the app
+                        try (FileOutputStream fos = new FileOutputStream(cacheFile)) {
+                            fos.write(response.body().bytes());
+                        }
+
+                        // Save to public Downloads folder using MediaStore or File API
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            ContentValues values = new ContentValues();
+                            values.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName);
+                            values.put(MediaStore.MediaColumns.MIME_TYPE, "application/pdf");
+                            values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+
+                            Uri downloadUri = getContentResolver().insert(MediaStore.Files.getContentUri("external"), values);
+                            if (downloadUri != null) {
+                                try (InputStream cacheIn = getContentResolver().openInputStream(Uri.fromFile(cacheFile));
+                                     OutputStream fos = getContentResolver().openOutputStream(downloadUri)) {
+                                    if (cacheIn != null && fos != null) {
+                                        byte[] buffer = new byte[4096];
+                                        int bytesRead;
+                                        while ((bytesRead = cacheIn.read(buffer)) != -1) {
+                                            fos.write(buffer, 0, bytesRead);
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            File downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                            File destFile = new File(downloadsDir, fileName);
+                            try (InputStream cacheIn = getContentResolver().openInputStream(Uri.fromFile(cacheFile));
+                                 OutputStream fos = new FileOutputStream(destFile)) {
+                                if (cacheIn != null) {
+                                    byte[] buffer = new byte[4096];
+                                    int bytesRead;
+                                    while ((bytesRead = cacheIn.read(buffer)) != -1) {
+                                        fos.write(buffer, 0, bytesRead);
+                                    }
+                                }
+                            }
+                        }
+
+                        mainHandler.post(() -> {
+                            progress.dismiss();
+                            Toast.makeText(this, "Saved to Downloads as: " + fileName, Toast.LENGTH_LONG).show();
+                            currentUri = Uri.fromFile(cacheFile);
+                            displayPdf(currentUri);
+                        });
+                    } else {
+                        mainHandler.post(() -> {
+                            progress.dismiss();
+                            Toast.makeText(this, "Server error: " + response.code(), Toast.LENGTH_SHORT).show();
+                        });
+                    }
+                }
+            } catch (Exception e) {
+                mainHandler.post(() -> {
+                    progress.dismiss();
+                    Toast.makeText(this, "Error: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                });
+            }
+        });
     }
 
     private void runTextSearch(String query) {
@@ -194,5 +353,5 @@ public class PdfViewerActivity extends AppCompatActivity {
         destroyed = true;
         searchExecutor.shutdownNow();
     }
-                }
-        
+    }
+            
