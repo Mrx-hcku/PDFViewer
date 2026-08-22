@@ -50,7 +50,7 @@ public class PdfViewerActivity extends AppCompatActivity {
     private int pageCount = 0;
     private int[] pageHeights; // display height per page (width-fitted, unscaled)
     private int screenWidth;
-    private static final int RENDER_SCALE = 2; // supersample so pinch-zoom stays sharp
+    private int renderScale = 2; // supersample so pinch-zoom stays sharp — lowered on low-RAM devices, see onCreate
 
     private Uri currentUri;
     private boolean nightMode = false;
@@ -86,7 +86,14 @@ public class PdfViewerActivity extends AppCompatActivity {
         screenWidth = getResources().getDisplayMetrics().widthPixels;
 
         long maxMemory = Runtime.getRuntime().maxMemory() / 1024;
-        int cacheSize = (int) (maxMemory / 16);
+        // Low-RAM devices (small per-app heap) skip the risky 2x supersample
+        // attempt entirely and start at native resolution, rather than reliably
+        // hitting OutOfMemoryError on tier 1 every single page.
+        if (maxMemory < 96 * 1024) { // under ~96MB heap
+            renderScale = 1;
+        }
+
+        int cacheSize = (int) (maxMemory / 20);
         bitmapCache = new LruCache<Integer, Bitmap>(cacheSize) {
             @Override
             protected int sizeOf(Integer key, Bitmap bitmap) {
@@ -270,22 +277,26 @@ public class PdfViewerActivity extends AppCompatActivity {
             Bitmap bitmap = null;
             synchronized (rendererLock) {
                 if (pdfRenderer == null || destroyed) return;
-                int w = screenWidth * RENDER_SCALE;
-                int h = pageHeights[position] * RENDER_SCALE;
+                int w = screenWidth * renderScale;
+                int h = pageHeights[position] * renderScale;
                 try {
                     bitmap = renderAtSize(position, w, h);
                 } catch (OutOfMemoryError oom) {
-                    // Tier 2: native (1x) resolution.
+                    // Tier 2: free up memory held by our own cache first (System.gc()
+                    // alone won't help if the heap is full of OUR cached bitmaps),
+                    // then retry at native (1x) resolution.
+                    bitmapCache.evictAll();
                     System.gc();
                     try {
                         bitmap = renderAtSize(position, screenWidth, pageHeights[position]);
                     } catch (OutOfMemoryError oom2) {
                         // Tier 3: half resolution — aspect ratio stays correct,
                         // page just looks a bit softer. Last resort before giving up.
+                        bitmapCache.evictAll();
                         System.gc();
                         try {
-                            int halfW = screenWidth / 2;
-                            int halfH = pageHeights[position] / 2;
+                            int halfW = Math.max(1, screenWidth / 2);
+                            int halfH = Math.max(1, pageHeights[position] / 2);
                             bitmap = renderAtSize(position, halfW, halfH);
                         } catch (OutOfMemoryError oom3) {
                             bitmap = null;
