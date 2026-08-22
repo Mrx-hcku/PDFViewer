@@ -10,7 +10,7 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
-        maven { url 'https://jitpack.io' }
+        maven { url 'https://jitpack.io' } // <- Yeh hona zaroori hai
     }
 }
 rootProject.name = "PDFViewer"
