@@ -39,4 +39,5 @@ dependencies {
     implementation 'com.unity3d.ads:unity-ads:4.16.5'
     implementation 'com.tom-roush:pdfbox-android:2.0.27.0'
     implementation 'com.github.mhiew:android-pdf-viewer:3.2.0-beta.3'
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
 }
