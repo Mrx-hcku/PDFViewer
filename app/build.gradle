@@ -38,7 +38,5 @@ dependencies {
     implementation 'com.google.android.material:material:1.11.0[span_15](start_span)'[span_15](end_span)
     implementation 'com.unity3d.ads:unity-ads:4.16.5[span_16](start_span)'[span_16](end_span)
     implementation 'com.tom-roush:pdfbox-android:2.0.27.0[span_17](start_span)'[span_17](end_span)
-    
-    // Updated working AndroidPdfViewer for GitHub Actions & modern Android SDK
     implementation 'com.github.mhiew:android-pdf-viewer:3.2.0-beta.1'
 }
