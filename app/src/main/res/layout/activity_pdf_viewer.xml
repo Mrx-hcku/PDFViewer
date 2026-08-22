@@ -1,3 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
@@ -11,26 +12,20 @@
         android:elevation="4dp"
         android:titleTextColor="@android:color/white" />
 
-    <com.mycompany.pdfviewer.ZoomableContainer
+    <!-- AndroidPdfViewer ka PDFView component -->
+    <com.github.barteksc.pdfviewer.PDFView
+        android:id="@+id/pdfView"
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
-        android:background="#DDDDDD">
+        android:background="#DDDDDD" />
 
-        <androidx.recyclerview.widget.RecyclerView
-            android:id="@+id/pageList"
-            android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:clipToPadding="false"
-            android:paddingTop="4dp"
-            android:paddingBottom="4dp" />
-
-    </com.mycompany.pdfviewer.ZoomableContainer>
-
-    <TextView android:id="@+id/pageIndicator"
+    <TextView 
+        android:id="@+id/pageIndicator"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:gravity="center"
         android:padding="6dp"
         android:text="1/1" />
+
 </LinearLayout>
