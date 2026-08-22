@@ -3,33 +3,21 @@ package com.mycompany.pdfviewer;
 import android.app.AlertDialog;
 import android.app.ProgressDialog;
 import android.content.Intent;
-import android.graphics.Bitmap;
-import android.graphics.ColorMatrix;
-import android.graphics.ColorMatrixColorFilter;
-import android.graphics.pdf.PdfRenderer;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.os.ParcelFileDescriptor;
 import android.text.InputType;
-import android.util.LruCache;
-import android.view.LayoutInflater;
 import android.view.Menu;
 import android.view.MenuItem;
-import android.view.View;
-import android.view.ViewGroup;
 import android.widget.EditText;
-import android.widget.ImageView;
-import android.widget.TextView;
 import android.widget.Toast;
 
-import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.widget.Toolbar;
-import androidx.recyclerview.widget.LinearLayoutManager;
-import androidx.recyclerview.widget.RecyclerView;
 
+import com.github.barteksc.pdfviewer.PDFView;
+import com.github.barteksc.pdfviewer.scroll.DefaultScrollHandle;
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader;
 import com.tom_roush.pdfbox.pdmodel.PDDocument;
 import com.tom_roush.pdfbox.text.PDFTextStripper;
@@ -42,29 +30,13 @@ import java.util.concurrent.Executors;
 
 public class PdfViewerActivity extends AppCompatActivity {
 
-    private RecyclerView pageList;
-    private TextView pageIndicator;
-    private LinearLayoutManager layoutManager;
-    private PdfRenderer pdfRenderer;
-    private ParcelFileDescriptor fileDescriptor;
-    private int pageCount = 0;
-    private int[] pageHeights; // display height per page (width-fitted, unscaled)
-    private int screenWidth;
-    private int renderScale = 2; // supersample so pinch-zoom stays sharp — lowered on low-RAM devices, see onCreate
-
+    private PDFView pdfView;
     private Uri currentUri;
-    private boolean nightMode = false;
-    private static final ColorMatrixColorFilter NIGHT_FILTER = new ColorMatrixColorFilter(new float[]{
-            -1f, 0f, 0f, 0f, 255f,
-            0f, -1f, 0f, 0f, 255f,
-            0f, 0f, -1f, 0f, 255f,
-            0f, 0f, 0f, 1f, 0f
-    });
+    private int pageCount = 0;
+    private int current radicales = 0;
 
-    private final ExecutorService renderExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService searchExecutor = Executors.newSingleThreadExecutor();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private LruCache<Integer, Bitmap> bitmapCache;
-    private final Object rendererLock = new Object();
     private volatile boolean destroyed = false;
 
     @Override
@@ -78,46 +50,12 @@ public class PdfViewerActivity extends AppCompatActivity {
         setSupportActionBar(toolbar);
         if (getSupportActionBar() != null) getSupportActionBar().setDisplayHomeAsUpEnabled(true);
 
-        pageList = findViewById(R.id.pageList);
-        pageIndicator = findViewById(R.id.pageIndicator);
-        layoutManager = new LinearLayoutManager(this);
-        pageList.setLayoutManager(layoutManager);
-
-        screenWidth = getResources().getDisplayMetrics().widthPixels;
-
-        long maxMemory = Runtime.getRuntime().maxMemory() / 1024;
-        // Low-RAM devices (small per-app heap) skip the risky 2x supersample
-        // attempt entirely and start at native resolution, rather than reliably
-        // hitting OutOfMemoryError on tier 1 every single page.
-        if (maxMemory < 96 * 1024) { // under ~96MB heap
-            renderScale = 1;
-        }
-
-        int cacheSize = (int) (maxMemory / 20);
-        bitmapCache = new LruCache<Integer, Bitmap>(cacheSize) {
-            @Override
-            protected int sizeOf(Integer key, Bitmap bitmap) {
-                return bitmap.getByteCount() / 1024;
-            }
-
-            @Override
-            protected void entryRemoved(boolean evicted, Integer key, Bitmap oldValue, Bitmap newValue) {
-                if (oldValue != null && !oldValue.isRecycled()) oldValue.recycle();
-            }
-        };
-
-        pageList.addOnScrollListener(new RecyclerView.OnScrollListener() {
-            @Override
-            public void onScrolled(@NonNull RecyclerView rv, int dx, int dy) {
-                int pos = layoutManager.findFirstVisibleItemPosition();
-                if (pos >= 0) pageIndicator.setText((pos + 1) + "/" + pageCount);
-            }
-        });
+        pdfView = findViewById(R.id.pdfView);
 
         Uri uri = resolveIncomingUri();
         if (uri != null) {
             currentUri = uri;
-            openPdf(uri);
+            displayPdf(uri);
         } else {
             Toast.makeText(this, "No PDF to open", Toast.LENGTH_LONG).show();
         }
@@ -134,6 +72,30 @@ public class PdfViewerActivity extends AppCompatActivity {
         return null;
     }
 
+    private void displayPdf(Uri uri) {
+        try {
+            pdfView.fromUri(uri)
+                    .enableSwipe(true) // Allow horizontal/vertical swipe
+                    .swipeHorizontal(false) // Vertical scroll like real readers
+                    .enableDoubletap(true)
+                    .defaultPage(0)
+                    .enableAnnotationRendering(true)
+                    .scrollHandle(new DefaultScrollHandle(this))
+                    .enableAntialiasing(true)
+                    .onLoad(nbPages -> {
+                        pageCount = nbPages;
+                        setTitle("1 / " + pageCount);
+                    })
+                    .onPageChange((page, pageCount) -> {
+                        setTitle((page + 1) + " / " + pageCount);
+                    })
+                    .onError(t -> Toast.makeText(PdfViewerActivity.this, "Error loading PDF: " + t.getMessage(), Toast.LENGTH_LONG).show())
+                    .load();
+        } catch (Exception e) {
+            Toast.makeText(this, "Failed to open PDF: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
     @Override
     public boolean onCreateOptionsMenu(Menu menu) {
         getMenuInflater().inflate(R.menu.menu_viewer, menu);
@@ -146,16 +108,12 @@ public class PdfViewerActivity extends AppCompatActivity {
         if (id == android.R.id.home) { finish(); return true; }
         if (id == R.id.action_jump) { showJumpDialog(); return true; }
         if (id == R.id.action_search_text) { showSearchDialog(); return true; }
-        if (id == R.id.action_night_mode) {
-            nightMode = !nightMode;
-            item.setChecked(nightMode);
-            if (pageList.getAdapter() != null) pageList.getAdapter().notifyDataSetChanged();
-            return true;
-        }
+        // Night mode can be handled via themes or library settings if configured
         return super.onOptionsItemSelected(item);
     }
 
     private void showJumpDialog() {
+        if (pageCount == 0) return;
         EditText input = new EditText(this);
         input.setInputType(InputType.TYPE_CLASS_NUMBER);
         new AlertDialog.Builder(this)
@@ -164,8 +122,9 @@ public class PdfViewerActivity extends AppCompatActivity {
                 .setPositiveButton("Go", (dialog, which) -> {
                     try {
                         int page = Integer.parseInt(input.getText().toString()) - 1;
-                        if (page >= 0 && page < pageCount)
-                            pageList.smoothScrollToPosition(page);
+                        if (page >= 0 && page < pageCount) {
+                            pdfView.jumpTo(page);
+                        }
                     } catch (Exception ignored) {}
                 })
                 .setNegativeButton("Cancel", null)
@@ -193,7 +152,7 @@ public class PdfViewerActivity extends AppCompatActivity {
         progress.setCancelable(false);
         progress.show();
 
-        renderExecutor.execute(() -> {
+        searchExecutor.execute(() -> {
             Integer foundPage = null;
             try (InputStream is = getContentResolver().openInputStream(currentUri)) {
                 if (is == null) throw new IOException("Cannot open PDF");
@@ -221,7 +180,7 @@ public class PdfViewerActivity extends AppCompatActivity {
                 if (destroyed) return;
                 progress.dismiss();
                 if (resultPage != null) {
-                    pageList.smoothScrollToPosition(resultPage);
+                    pdfView.jumpTo(resultPage);
                     Toast.makeText(PdfViewerActivity.this, "Found on page " + (resultPage + 1), Toast.LENGTH_SHORT).show();
                 } else {
                     Toast.makeText(PdfViewerActivity.this, "Not found in this PDF", Toast.LENGTH_SHORT).show();
@@ -230,169 +189,10 @@ public class PdfViewerActivity extends AppCompatActivity {
         });
     }
 
-    private void openPdf(Uri uri) {
-        renderExecutor.execute(() -> {
-            try {
-                ParcelFileDescriptor fd = getContentResolver().openFileDescriptor(uri, "r");
-                if (fd == null) return;
-                synchronized (rendererLock) {
-                    fileDescriptor = fd;
-                    pdfRenderer = new PdfRenderer(fileDescriptor);
-                    pageCount = pdfRenderer.getPageCount();
-                    pageHeights = new int[pageCount];
-                    for (int i = 0; i < pageCount; i++) {
-                        PdfRenderer.Page page = pdfRenderer.openPage(i);
-                        float ratio = (float) page.getHeight() / page.getWidth();
-                        pageHeights[i] = Math.round(screenWidth * ratio);
-                        page.close();
-                    }
-                }
-                mainHandler.post(() -> {
-                    if (destroyed) return;
-                    pageList.setAdapter(new PdfPageAdapter());
-                    pageIndicator.setText("1/" + pageCount);
-                });
-            } catch (Exception e) {
-                mainHandler.post(() -> {
-                    if (!destroyed) {
-                        Toast.makeText(PdfViewerActivity.this,
-                                "Failed to open PDF: " + e.getMessage(), Toast.LENGTH_LONG).show();
-                    }
-                });
-            }
-        });
-    }
-
-    private void renderPage(int position, ImageView imageView) {
-        Bitmap cached = bitmapCache.get(position);
-        if (cached != null && !cached.isRecycled()) {
-            imageView.setImageBitmap(cached);
-            return;
-        }
-        imageView.setImageBitmap(null);
-        imageView.setTag(position);
-
-        renderExecutor.execute(() -> {
-            if (destroyed) return;
-            Bitmap bitmap = null;
-            synchronized (rendererLock) {
-                if (pdfRenderer == null || destroyed) return;
-                int w = screenWidth * renderScale;
-                int h = pageHeights[position] * renderScale;
-                try {
-                    bitmap = renderAtSize(position, w, h);
-                } catch (OutOfMemoryError oom) {
-                    // Tier 2: free up memory held by our own cache first (System.gc()
-                    // alone won't help if the heap is full of OUR cached bitmaps),
-                    // then retry at native (1x) resolution.
-                    bitmapCache.evictAll();
-                    System.gc();
-                    try {
-                        bitmap = renderAtSize(position, screenWidth, pageHeights[position]);
-                    } catch (OutOfMemoryError oom2) {
-                        // Tier 3: half resolution — aspect ratio stays correct,
-                        // page just looks a bit softer. Last resort before giving up.
-                        bitmapCache.evictAll();
-                        System.gc();
-                        try {
-                            int halfW = Math.max(1, screenWidth / 2);
-                            int halfH = Math.max(1, pageHeights[position] / 2);
-                            bitmap = renderAtSize(position, halfW, halfH);
-                        } catch (OutOfMemoryError oom3) {
-                            bitmap = null;
-                        } catch (Exception ignored) {
-                            bitmap = null;
-                        }
-                    } catch (Exception ignored) {
-                        bitmap = null;
-                    }
-                } catch (Exception e) {
-                    bitmap = null;
-                }
-            }
-            if (bitmap == null) {
-                mainHandler.post(() -> {
-                    if (!destroyed) Toast.makeText(PdfViewerActivity.this,
-                            "Page " + (position + 1) + " ke liye memory kam pad gayi", Toast.LENGTH_SHORT).show();
-                });
-                return;
-            }
-            bitmapCache.put(position, bitmap);
-            Bitmap finalBitmap = bitmap;
-            mainHandler.post(() -> {
-                if (destroyed) return;
-                if (imageView.getTag() != null && (int) imageView.getTag() == position) {
-                    imageView.setImageBitmap(finalBitmap);
-                }
-            });
-        });
-    }
-
-    /** Must be called while holding rendererLock. */
-    private Bitmap renderAtSize(int position, int w, int h) throws Exception {
-        PdfRenderer.Page page = pdfRenderer.openPage(position);
-        try {
-            // RGB_565 halves memory vs ARGB_8888 — PDF pages are opaque, no alpha needed.
-            Bitmap bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.RGB_565);
-            bitmap.eraseColor(0xFFFFFFFF);
-            page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
-            return bitmap;
-        } finally {
-            page.close();
-        }
-    }
-
     @Override
     protected void onDestroy() {
         super.onDestroy();
         destroyed = true;
-        renderExecutor.execute(() -> {
-            synchronized (rendererLock) {
-                try {
-                    if (pdfRenderer != null) pdfRenderer.close();
-                    if (fileDescriptor != null) fileDescriptor.close();
-                } catch (IOException ignored) {}
-            }
-        });
-        renderExecutor.shutdown();
-        bitmapCache.evictAll();
-    }
-
-    private class PdfPageAdapter extends RecyclerView.Adapter<PdfPageAdapter.VH> {
-        @NonNull
-        @Override
-        public VH onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
-            ImageView v = (ImageView) LayoutInflater.from(parent.getContext())
-                    .inflate(R.layout.item_pdf_page, parent, false);
-            return new VH(v);
-        }
-
-        @Override
-        public void onBindViewHolder(@NonNull VH holder, int position) {
-            ViewGroup.LayoutParams lp = holder.image.getLayoutParams();
-            lp.height = pageHeights[position];
-            holder.image.setLayoutParams(lp);
-            holder.image.setColorFilter(nightMode ? NIGHT_FILTER : null);
-            renderPage(position, holder.image);
-        }
-
-        @Override
-        public void onViewRecycled(@NonNull VH holder) {
-            super.onViewRecycled(holder);
-            holder.image.setTag(null);
-        }
-
-        @Override
-        public int getItemCount() {
-            return pageCount;
-        }
-
-        class VH extends RecyclerView.ViewHolder {
-            ImageView image;
-            VH(View itemView) {
-                super(itemView);
-                image = (ImageView) itemView;
-            }
-        }
+        searchExecutor.shutdownNow();
     }
 }
