@@ -19,6 +19,7 @@ import android.view.ViewGroup;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -27,6 +28,9 @@ import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.widget.Toolbar;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
+
+import com.google.android.material.bottomnavigation.BottomNavigationView;
+import com.google.android.material.card.MaterialCardView;
 import com.unity3d.ads.IUnityAdsInitializationListener;
 import com.unity3d.ads.IUnityAdsLoadListener;
 import com.unity3d.ads.IUnityAdsShowListener;
@@ -34,6 +38,9 @@ import com.unity3d.ads.UnityAds;
 import com.unity3d.services.banners.BannerErrorInfo;
 import com.unity3d.services.banners.BannerView;
 import com.unity3d.services.banners.UnityBannerSize;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 import java.io.File;
 import java.text.SimpleDateFormat;
@@ -43,9 +50,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-
-import org.json.JSONArray;
-import org.json.JSONObject;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -99,6 +103,31 @@ public class MainActivity extends AppCompatActivity {
         recyclerView.setLayoutManager(new LinearLayoutManager(this));
         recyclerView.setAdapter(new PdfAdapter());
 
+        BottomNavigationView bottomNavigation = findViewById(R.id.bottomNavigation);
+        final LinearLayout pdfSectionLayout = findViewById(R.id.pdfSectionLayout);
+        final LinearLayout toolsSectionLayout = findViewById(R.id.toolsSectionLayout);
+        MaterialCardView cardEditPdfTool = findViewById(R.id.cardEditPdfTool);
+
+        bottomNavigation.setOnItemSelectedListener(item -> {
+            int id = item.getItemId();
+            if (id == R.id.nav_pdfs) {
+                pdfSectionLayout.setVisibility(View.VISIBLE);
+                toolsSectionLayout.setVisibility(View.GONE);
+                if (getSupportActionBar() != null) getSupportActionBar().setTitle("PDF Viewer");
+                return true;
+            } else if (id == R.id.nav_tools) {
+                pdfSectionLayout.setVisibility(View.GONE);
+                toolsSectionLayout.setVisibility(View.VISIBLE);
+                if (getSupportActionBar() != null) getSupportActionBar().setTitle("PDF Tools");
+                return true;
+            }
+            return false;
+        });
+
+        cardEditPdfTool.setOnClickListener(v -> 
+            Toast.makeText(MainActivity.this, "Please open a PDF from the PDFs tab to edit it inside the viewer.", Toast.LENGTH_LONG).show()
+        );
+
         searchBox.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
             @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
@@ -134,7 +163,7 @@ public class MainActivity extends AppCompatActivity {
         if (!hasStoragePermission()) {
             emptyText.setText("Storage permission needed. Tap here to allow access.");
             emptyText.setOnClickListener(v -> requestStoragePermission());
-            Toast.makeText(this, "Grant 'All files access' to auto-load PDFs", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "Grant All files access to auto-load PDFs", Toast.LENGTH_LONG).show();
             requestStoragePermission();
         }
     }
@@ -159,8 +188,6 @@ public class MainActivity extends AppCompatActivity {
             scanDevice();
         }
     }
-
-    // ---------- Background scan ----------
 
     private void scanDevice() {
         if (scanning) return;
@@ -227,8 +254,6 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    // ---------- Search toggle ----------
-
     private void toggleSearch() {
         searchVisible = !searchVisible;
         if (searchVisible) {
@@ -243,8 +268,6 @@ public class MainActivity extends AppCompatActivity {
             if (imm != null) imm.hideSoftInputFromWindow(searchBox.getWindowToken(), 0);
         }
     }
-
-    // ---------- Ads ----------
 
     private void initAds() {
         UnityAds.initialize(this, GAME_ID, TEST_MODE, new IUnityAdsInitializationListener() {
@@ -273,11 +296,8 @@ public class MainActivity extends AppCompatActivity {
                 });
             }
 
-            @Override
-            public void onBannerShown(BannerView bannerAdView) {}
-
-            @Override
-            public void onBannerClick(BannerView bannerAdView) {}
+            @Override public void onBannerShown(BannerView bannerAdView) {}
+            @Override public void onBannerClick(BannerView bannerAdView) {}
 
             @Override
             public void onBannerFailedToLoad(BannerView bannerAdView, BannerErrorInfo errorInfo) {
@@ -285,8 +305,7 @@ public class MainActivity extends AppCompatActivity {
                 runOnUiThread(() -> bannerContainer.setVisibility(View.GONE));
             }
 
-            @Override
-            public void onBannerLeftApplication(BannerView bannerAdView) {}
+            @Override public void onBannerLeftApplication(BannerView bannerAdView) {}
         });
         bannerContainer.addView(bannerView);
         bannerView.load();
@@ -303,7 +322,6 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onUnityAdsFailedToLoad(String placementId, UnityAds.UnityAdsLoadError error, String message) {
                 interstitialReady = false;
-                Log.e(TAG, "Interstitial failed: [" + error + "] " + message);
                 retryInterstitial();
             }
         });
@@ -331,7 +349,6 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onUnityAdsFailedToLoad(String placementId, UnityAds.UnityAdsLoadError error, String message) {
                 rewardedReady = false;
-                Log.e(TAG, "Rewarded failed: [" + error + "] " + message);
                 retryRewarded();
             }
         });
@@ -357,7 +374,6 @@ public class MainActivity extends AppCompatActivity {
         UnityAds.show(this, REWARDED_PLACEMENT, new IUnityAdsShowListener() {
             @Override
             public void onUnityAdsShowFailure(String placementId, UnityAds.UnityAdsShowError error, String message) {
-                Log.e(TAG, "Rewarded show failed: [" + error + "] " + message);
                 rewardedReady = false;
             }
             @Override public void onUnityAdsShowStart(String placementId) {}
@@ -375,8 +391,6 @@ public class MainActivity extends AppCompatActivity {
             }
         });
     }
-
-    // ---------- Menu ----------
 
     @Override
     public boolean onCreateOptionsMenu(Menu menu) {
@@ -398,8 +412,6 @@ public class MainActivity extends AppCompatActivity {
         return super.onOptionsItemSelected(item);
     }
 
-    // ---------- List ----------
-
     private void filterList(String query) {
         filteredPdfs.clear();
         for (String[] item : allPdfs) {
@@ -412,7 +424,9 @@ public class MainActivity extends AppCompatActivity {
             emptyText.setVisibility(filteredPdfs.isEmpty() ? View.VISIBLE : View.GONE);
             emptyText.setText(allPdfs.isEmpty() ? "No PDFs found on device." : "No matching PDFs found.");
         }
-        recyclerView.getAdapter().notifyDataSetChanged();
+        if (recyclerView.getAdapter() != null) {
+            recyclerView.getAdapter().notifyDataSetChanged();
+        }
     }
 
     private void openViewer(Uri uri) {
@@ -423,7 +437,6 @@ public class MainActivity extends AppCompatActivity {
         UnityAds.show(this, INTERSTITIAL_PLACEMENT, new IUnityAdsShowListener() {
             @Override
             public void onUnityAdsShowFailure(String placementId, UnityAds.UnityAdsShowError error, String message) {
-                Log.e(TAG, "Interstitial show failed: [" + error + "] " + message);
                 navigateToViewer(uri);
             }
             @Override public void onUnityAdsShowStart(String placementId) {}
@@ -485,3 +498,4 @@ public class MainActivity extends AppCompatActivity {
         }
     }
     }
+    
