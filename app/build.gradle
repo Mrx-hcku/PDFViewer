@@ -38,4 +38,7 @@ dependencies {
     implementation 'com.google.android.material:material:1.11.0'
     implementation 'com.unity3d.ads:unity-ads:4.16.5'
     implementation 'com.tom-roush:pdfbox-android:2.0.27.0'
+    
+    // Real-world PDF Viewer Library (Handles Zooming, Memory, & Rendering natively)
+    implementation 'com.github.barteksc:android-pdf-viewer:2.8.2'
 }
