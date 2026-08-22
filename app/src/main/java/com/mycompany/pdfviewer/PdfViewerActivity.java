@@ -33,7 +33,7 @@ public class PdfViewerActivity extends AppCompatActivity {
     private PDFView pdfView;
     private Uri currentUri;
     private int pageCount = 0;
-    private int current radicales = 0;
+    private int currentRadicales = 0; // Error fixed here
 
     private final ExecutorService searchExecutor = Executors.newSingleThreadExecutor();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -75,8 +75,8 @@ public class PdfViewerActivity extends AppCompatActivity {
     private void displayPdf(Uri uri) {
         try {
             pdfView.fromUri(uri)
-                    .enableSwipe(true) // Allow horizontal/vertical swipe
-                    .swipeHorizontal(false) // Vertical scroll like real readers
+                    .enableSwipe(true)
+                    .swipeHorizontal(false)
                     .enableDoubletap(true)
                     .defaultPage(0)
                     .enableAnnotationRendering(true)
@@ -108,7 +108,6 @@ public class PdfViewerActivity extends AppCompatActivity {
         if (id == android.R.id.home) { finish(); return true; }
         if (id == R.id.action_jump) { showJumpDialog(); return true; }
         if (id == R.id.action_search_text) { showSearchDialog(); return true; }
-        // Night mode can be handled via themes or library settings if configured
         return super.onOptionsItemSelected(item);
     }
 
@@ -195,4 +194,5 @@ public class PdfViewerActivity extends AppCompatActivity {
         destroyed = true;
         searchExecutor.shutdownNow();
     }
-}
+                }
+        
