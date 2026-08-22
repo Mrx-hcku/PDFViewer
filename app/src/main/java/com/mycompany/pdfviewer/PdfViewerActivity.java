@@ -275,14 +275,23 @@ public class PdfViewerActivity extends AppCompatActivity {
                 try {
                     bitmap = renderAtSize(position, w, h);
                 } catch (OutOfMemoryError oom) {
-                    // Fall back to native (1x) resolution if the supersampled
-                    // bitmap doesn't fit in memory — better a slightly softer
-                    // zoom than a crash on large/high-res PDFs.
+                    // Tier 2: native (1x) resolution.
                     System.gc();
                     try {
                         bitmap = renderAtSize(position, screenWidth, pageHeights[position]);
                     } catch (OutOfMemoryError oom2) {
-                        bitmap = null;
+                        // Tier 3: half resolution — aspect ratio stays correct,
+                        // page just looks a bit softer. Last resort before giving up.
+                        System.gc();
+                        try {
+                            int halfW = screenWidth / 2;
+                            int halfH = pageHeights[position] / 2;
+                            bitmap = renderAtSize(position, halfW, halfH);
+                        } catch (OutOfMemoryError oom3) {
+                            bitmap = null;
+                        } catch (Exception ignored) {
+                            bitmap = null;
+                        }
                     } catch (Exception ignored) {
                         bitmap = null;
                     }
@@ -375,4 +384,4 @@ public class PdfViewerActivity extends AppCompatActivity {
             }
         }
     }
-    }
+}
