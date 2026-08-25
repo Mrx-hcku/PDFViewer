@@ -12,6 +12,21 @@
         app:showAsAction="never" />
 
     <item
+        android:id="@+id/action_ai_summary"
+        android:title="Summarize PDF (AI)"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_ai_explain"
+        android:title="Explain Word / Line (AI)"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_night_mode"
+        android:title="Toggle Night Mode"
+        app:showAsAction="never" />
+
+    <item
         android:id="@+id/action_edit_pdf"
         android:title="Edit PDF (Cloud)"
         app:showAsAction="never" />
