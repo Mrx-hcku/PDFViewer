@@ -61,7 +61,7 @@ public class PdfViewerActivity extends AppCompatActivity {
     private boolean rewardedReady = false;
 
     // Groq API Key Configured Safely
-    private static final String GROQ_API_KEY = "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";
+    private static final String GROQ_API_KEY = "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";
 
     private final ExecutorService backgroundExecutor = Executors.newSingleThreadExecutor();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
