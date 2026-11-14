@@ -60,8 +60,14 @@ public class PdfViewerActivity extends AppCompatActivity {
     private static final String REWARDED_PLACEMENT = "Rewarded_Android";
     private boolean rewardedReady = false;
 
-    // Groq API Key Configured Safely
-    private static final String GROQ_API_KEY = "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";
+    // Groq key is injected at build time from GitHub Secrets (see build.yml). Never hardcode it here.
+    private static final String GROQ_API_KEY = BuildConfig.GROQ_API_KEY;
+    private static final int MAX_AI_CHARS = 12000;
+
+    private static final OkHttpClient GROQ_CLIENT = new OkHttpClient.Builder()
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .build();
 
     private final ExecutorService backgroundExecutor = Executors.newSingleThreadExecutor();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -223,82 +229,97 @@ public class PdfViewerActivity extends AppCompatActivity {
         });
     }
 
-    private void requestAiSummary() {
-        ProgressDialog progress = new ProgressDialog(this);
+        private void requestAiSummary() {
+        final ProgressDialog progress = new ProgressDialog(this);
         progress.setMessage("AI is summarizing content...");
         progress.setCancelable(false);
         progress.show();
 
+        final int currentPageNum = pdfView.getCurrentPage() + 1;
+        final Uri uri = currentUri;
+
         backgroundExecutor.execute(() -> {
-            try (InputStream is = getContentResolver().openInputStream(currentUri)) {
+            String result = null;
+            try (InputStream is = getContentResolver().openInputStream(uri)) {
                 if (is == null) throw new IOException("Cannot read PDF");
+                String extractedText;
                 PDDocument document = PDDocument.load(is);
-                PDFTextStripper stripper = new PDFTextStripper();
-                int currentPageNum = pdfView.getCurrentPage() + 1;
-                stripper.setStartPage(currentPageNum);
-                stripper.setEndPage(currentPageNum);
-                String extractedText = stripper.getText(document);
-                document.close();
+                try {
+                    PDFTextStripper stripper = new PDFTextStripper();
+                    stripper.setStartPage(currentPageNum);
+                    stripper.setEndPage(currentPageNum);
+                    extractedText = stripper.getText(document);
+                } finally {
+                    document.close();
+                }
 
-                String prompt = "Summarize the following current page content clearly:\n\n" + extractedText;
-                String aiResponse = callGroqApi(prompt);
-
-                mainHandler.post(() -> {
-                    progress.dismiss();
-                    showResultDialog("AI Summary (Page " + currentPageNum + ")", aiResponse);
-                });
+                if (extractedText == null || extractedText.trim().length() < 10) {
+                    result = "No readable text found on this page. It looks like a scanned image, so AI cannot read it.";
+                } else {
+                    if (extractedText.length() > MAX_AI_CHARS) {
+                        extractedText = extractedText.substring(0, MAX_AI_CHARS);
+                    }
+                    result = callGroqApi("Summarize the following page content clearly. "
+                            + "Reply in the same language as the text.\n\n" + extractedText);
+                }
             } catch (Exception e) {
-                mainHandler.post(() -> {
-                    progress.dismiss();
-                    Toast.makeText(this, "Error: " + e.getMessage(), Toast.LENGTH_LONG).show();
-                });
+                result = "Error: " + e.getMessage();
             }
+
+            final String finalResult = result;
+            mainHandler.post(() -> {
+                if (destroyed) return;
+                progress.dismiss();
+                showResultDialog("AI Summary (Page " + currentPageNum + ")", finalResult);
+            });
         });
     }
 
-    private void showPageLinesForSelection() {
-        ProgressDialog progress = new ProgressDialog(this);
+        private void showPageLinesForSelection() {
+        final ProgressDialog progress = new ProgressDialog(this);
         progress.setMessage("Extracting lines for selection...");
         progress.setCancelable(false);
         progress.show();
 
-        backgroundExecutor.execute(() -> {
-            try (InputStream is = getContentResolver().openInputStream(currentUri)) {
-                if (is == null) throw new IOException("Cannot read PDF");
-                PDDocument document = PDDocument.load(is);
-                PDFTextStripper stripper = new PDFTextStripper();
-                int currentPageNum = pdfView.getCurrentPage() + 1;
-                stripper.setStartPage(currentPageNum);
-                stripper.setEndPage(currentPageNum);
-                String pageText = stripper.getText(document);
-                document.close();
+        final int currentPageNum = pdfView.getCurrentPage() + 1;
+        final Uri uri = currentUri;
 
-                final String[] lines = pageText.split("\\r?\\n");
-                java.util.List<String> lineList = new java.util.ArrayList<>();
-                for (String l : lines) {
+        backgroundExecutor.execute(() -> {
+            try (InputStream is = getContentResolver().openInputStream(uri)) {
+                if (is == null) throw new IOException("Cannot read PDF");
+                String pageText;
+                PDDocument document = PDDocument.load(is);
+                try {
+                    PDFTextStripper stripper = new PDFTextStripper();
+                    stripper.setStartPage(currentPageNum);
+                    stripper.setEndPage(currentPageNum);
+                    pageText = stripper.getText(document);
+                } finally {
+                    document.close();
+                }
+
+                final java.util.List<String> lineList = new java.util.ArrayList<>();
+                for (String l : pageText.split("\\r?\\n")) {
                     if (!l.trim().isEmpty()) lineList.add(l.trim());
                 }
 
                 mainHandler.post(() -> {
+                    if (destroyed) return;
                     progress.dismiss();
                     if (lineList.isEmpty()) {
-                        Toast.makeText(this, "No text found on this page to select.", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(this, "No text found on this page. It may be a scanned image.", Toast.LENGTH_LONG).show();
                         return;
                     }
-
-                    String[] lineArray = lineList.toArray(new String[0]);
+                    final String[] lineArray = lineList.toArray(new String[0]);
                     new AlertDialog.Builder(this)
                             .setTitle("Tap a line to explain (Page " + currentPageNum + ")")
-                            .setItems(lineArray, (dialog, which) -> {
-                                String selectedLine = lineArray[which];
-                                requestAiExplanation(selectedLine);
-                            })
+                            .setItems(lineArray, (dialog, which) -> requestAiExplanation(lineArray[which]))
                             .setNegativeButton("Cancel", null)
                             .show();
                 });
-
             } catch (Exception e) {
                 mainHandler.post(() -> {
+                    if (destroyed) return;
                     progress.dismiss();
                     Toast.makeText(this, "Error extracting text: " + e.getMessage(), Toast.LENGTH_LONG).show();
                 });
@@ -306,29 +327,29 @@ public class PdfViewerActivity extends AppCompatActivity {
         });
     }
 
-    private void requestAiExplanation(String query) {
-        ProgressDialog progress = new ProgressDialog(this);
+        private void requestAiExplanation(String query) {
+        final ProgressDialog progress = new ProgressDialog(this);
         progress.setMessage("AI is explaining selected line...");
         progress.setCancelable(false);
         progress.show();
 
         backgroundExecutor.execute(() -> {
-            String prompt = "Explain the following text/line clearly and simply:\n\n" + query;
-            String aiResponse = callGroqApi(prompt);
+            String prompt = "Explain the following text/line clearly and simply. "
+                    + "Reply in the same language as the text.\n\n" + query;
+            final String aiResponse = callGroqApi(prompt);
             mainHandler.post(() -> {
+                if (destroyed) return;
                 progress.dismiss();
                 showResultDialog("AI Explanation", aiResponse);
             });
         });
     }
 
-    private String callGroqApi(String prompt) {
+        private String callGroqApi(String prompt) {
+        if (GROQ_API_KEY == null || GROQ_API_KEY.isEmpty()) {
+            return "AI key is missing in this build.";
+        }
         try {
-            OkHttpClient client = new OkHttpClient.Builder()
-                    .connectTimeout(30, TimeUnit.SECONDS)
-                    .readTimeout(30, TimeUnit.SECONDS)
-                    .build();
-
             JSONObject jsonBody = new JSONObject();
             jsonBody.put("model", "llama-3.3-70b-versatile");
 
@@ -337,7 +358,6 @@ public class PdfViewerActivity extends AppCompatActivity {
             msg.put("role", "user");
             msg.put("content", prompt);
             messages.put(msg);
-
             jsonBody.put("messages", messages);
 
             RequestBody body = RequestBody.create(
@@ -352,23 +372,34 @@ public class PdfViewerActivity extends AppCompatActivity {
                     .post(body)
                     .build();
 
-            try (Response response = client.newCall(request).execute()) {
-                if (response.isSuccessful() && response.body() != null) {
-                    String resStr = response.body().string();
-                    JSONObject rootObj = new JSONObject(resStr);
-                    JSONArray choices = rootObj.getJSONArray("choices");
-                    if (choices.length() > 0) {
-                        return choices.getJSONObject(0).getJSONObject("message").getString("content").trim();
-                    }
+            try (Response response = GROQ_CLIENT.newCall(request).execute()) {
+                String resStr = response.body() != null ? response.body().string() : "";
+                if (!response.isSuccessful()) {
+                    return "AI error (HTTP " + response.code() + "): " + extractApiError(resStr);
+                }
+                JSONArray choices = new JSONObject(resStr).getJSONArray("choices");
+                if (choices.length() > 0) {
+                    return choices.getJSONObject(0).getJSONObject("message").getString("content").trim();
                 }
             }
+        } catch (java.net.UnknownHostException | java.net.SocketTimeoutException e) {
+            return "No internet connection or the request timed out.";
         } catch (Exception e) {
             return "Failed to connect to AI: " + e.getMessage();
         }
-        return "No response from AI.";
+        return "AI returned an empty response.";
     }
 
-    private void showResultDialog(String title, String message) {
+    private String extractApiError(String body) {
+        try {
+            return new JSONObject(body).getJSONObject("error").getString("message");
+        } catch (Exception e) {
+            return body.length() > 200 ? body.substring(0, 200) : body;
+        }
+    }
+
+        private void showResultDialog(String title, String message) {
+        if (destroyed || isFinishing()) return;
         new AlertDialog.Builder(this)
                 .setTitle(title)
                 .setMessage(message)
@@ -448,7 +479,7 @@ public class PdfViewerActivity extends AppCompatActivity {
             try {
                 InputStream inputStream = getContentResolver().openInputStream(currentUri);
                 if (inputStream == null) {
-                    mainHandler.post(() -> { progress.dismiss(); Toast.makeText(this, "Failed to read PDF file", Toast.LENGTH_SHORT).show(); });
+                    mainHandler.post(() -> { if (destroyed) return; progress.dismiss(); Toast.makeText(this, "Failed to read PDF file", Toast.LENGTH_SHORT).show(); });
                     return;
                 }
                 File tempFile = new File(getCacheDir(), "upload_temp.pdf");
@@ -488,17 +519,18 @@ public class PdfViewerActivity extends AppCompatActivity {
                         }
 
                         mainHandler.post(() -> {
+                            if (destroyed) return;
                             progress.dismiss();
                             Toast.makeText(this, "Saved & Updated successfully!", Toast.LENGTH_LONG).show();
                             currentUri = Uri.fromFile(cacheFile);
                             displayPdf(currentUri, pdfView.getCurrentPage());
                         });
                     } else {
-                        mainHandler.post(() -> { progress.dismiss(); Toast.makeText(this, "Server error: " + response.code(), Toast.LENGTH_SHORT).show(); });
+                        mainHandler.post(() -> { if (destroyed) return; progress.dismiss(); Toast.makeText(this, "Server error: " + response.code(), Toast.LENGTH_SHORT).show(); });
                     }
                 }
             } catch (Exception e) {
-                mainHandler.post(() -> { progress.dismiss(); Toast.makeText(this, "Error: " + e.getMessage(), Toast.LENGTH_LONG).show(); });
+                mainHandler.post(() -> { if (destroyed) return; progress.dismiss(); Toast.makeText(this, "Error: " + e.getMessage(), Toast.LENGTH_LONG).show(); });
             }
         });
     }
@@ -548,6 +580,7 @@ public class PdfViewerActivity extends AppCompatActivity {
     protected void onDestroy() {
         super.onDestroy();
         destroyed = true;
+        mainHandler.removeCallbacksAndMessages(null);
         backgroundExecutor.shutdownNow();
     }
 }

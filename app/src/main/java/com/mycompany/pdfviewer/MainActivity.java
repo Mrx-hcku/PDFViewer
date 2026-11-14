@@ -45,6 +45,7 @@ import org.json.JSONObject;
 import java.io.File;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
@@ -76,6 +77,7 @@ public class MainActivity extends AppCompatActivity {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService scanExecutor = Executors.newSingleThreadExecutor();
     private volatile boolean scanning = false;
+    private long lastScanTime = 0;
     private boolean destroyed = false;
 
     private boolean rewardedReady = false;
@@ -150,7 +152,7 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onResume() {
         super.onResume();
-        if (hasStoragePermission() && !scanning) scanDevice();
+        if (hasStoragePermission() && !scanning && System.currentTimeMillis() - lastScanTime > 30000) scanDevice();
     }
 
     private boolean hasStoragePermission() {
@@ -198,12 +200,14 @@ public class MainActivity extends AppCompatActivity {
             List<String[]> results = new ArrayList<>();
             File root = Environment.getExternalStorageDirectory();
             scanRecursive(root, 0, results);
+            Collections.sort(results, (a, b) -> Long.compare(Long.parseLong(b[3]), Long.parseLong(a[3])));
 
             if (destroyed) return;
             mainHandler.post(() -> {
                 if (destroyed) return;
                 allPdfs = results;
                 scanning = false;
+                lastScanTime = System.currentTimeMillis();
                 filterList(searchBox.getText().toString());
                 saveCachedList(results);
             });
@@ -249,7 +253,7 @@ public class MainActivity extends AppCompatActivity {
                 scanRecursive(f, depth + 1, results);
             } else if (f.getName().toLowerCase(Locale.ROOT).endsWith(".pdf")) {
                 String date = sdf.format(new Date(f.lastModified()));
-                results.add(new String[]{Uri.fromFile(f).toString(), f.getName(), date});
+                results.add(new String[]{Uri.fromFile(f).toString(), f.getName(), date, String.valueOf(f.lastModified())});
             }
         }
     }
@@ -290,10 +294,7 @@ public class MainActivity extends AppCompatActivity {
         bannerView.setListener(new BannerView.IListener() {
             @Override
             public void onBannerLoaded(BannerView bannerAdView) {
-                runOnUiThread(() -> {
-                    bannerContainer.setVisibility(View.VISIBLE);
-                    Toast.makeText(MainActivity.this, "Welcome to the app!", Toast.LENGTH_SHORT).show();
-                });
+                runOnUiThread(() -> bannerContainer.setVisibility(View.VISIBLE));
             }
 
             @Override public void onBannerShown(BannerView bannerAdView) {}
@@ -375,6 +376,7 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onUnityAdsShowFailure(String placementId, UnityAds.UnityAdsShowError error, String message) {
                 rewardedReady = false;
+                loadRewarded();
             }
             @Override public void onUnityAdsShowStart(String placementId) {}
             @Override public void onUnityAdsShowClick(String placementId) {}
@@ -422,7 +424,9 @@ public class MainActivity extends AppCompatActivity {
         }
         if (hasStoragePermission()) {
             emptyText.setVisibility(filteredPdfs.isEmpty() ? View.VISIBLE : View.GONE);
-            emptyText.setText(allPdfs.isEmpty() ? "No PDFs found on device." : "No matching PDFs found.");
+            emptyText.setText(allPdfs.isEmpty()
+                    ? (scanning ? "Scanning for PDFs..." : "No PDFs found on device.")
+                    : "No matching PDFs found.");
         }
         if (recyclerView.getAdapter() != null) {
             recyclerView.getAdapter().notifyDataSetChanged();
@@ -438,6 +442,8 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onUnityAdsShowFailure(String placementId, UnityAds.UnityAdsShowError error, String message) {
                 navigateToViewer(uri);
+                interstitialReady = false;
+                loadInterstitial();
             }
             @Override public void onUnityAdsShowStart(String placementId) {}
             @Override public void onUnityAdsShowClick(String placementId) {}
