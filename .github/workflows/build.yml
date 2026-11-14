@@ -54,7 +54,6 @@ jobs:
                 buildTypes {
                   release {
                     minifyEnabled true
-                    shrinkResources true
                     proguardFiles getDefaultProguardFile('proguard-android-optimize.txt')
                   }
                 }
@@ -74,6 +73,17 @@ jobs:
             }
           }
           EOF
+
+      # Your build.gradle has minifyEnabled false, which overrides the init script.
+      # Turn minify + resource shrinking on directly in the file (CI copy only).
+      - name: Enable minify and resource shrinking
+        run: |
+          for f in app/build.gradle app/build.gradle.kts; do
+            [ -f "$f" ] || continue
+            sed -i -E 's/minifyEnabled[[:space:]]+false/minifyEnabled true\n            shrinkResources true/' "$f"
+            sed -i -E 's/isMinifyEnabled[[:space:]]*=[[:space:]]*false/isMinifyEnabled = true\n            isShrinkResources = true/' "$f"
+          done
+          grep -n -i "minify\|shrink" app/build.gradle* || true
 
       - name: Build release APK
         env:
