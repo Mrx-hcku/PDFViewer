@@ -18,11 +18,77 @@ jobs:
       - name: Generate Gradle wrapper
         run: gradle wrapper --gradle-version 8.4
 
-      - name: Build APK
-        run: ./gradlew assembleDebug --stacktrace
+      # Optional: your own keystore (GitHub Secret KEYSTORE_BASE64).
+      # Without it, release APK is signed with debug key.
+      - name: Decode keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          fi
+
+      # Size reduction without editing build.gradle:
+      # R8 minify + resource shrink, only en/hi languages, 64-bit (arm64) only
+      - name: Create size optimization script
+        run: |
+          cat > "$RUNNER_TEMP/size.gradle" << 'EOF'
+          allprojects { proj ->
+            proj.pluginManager.withPlugin('com.android.application') {
+              proj.android {
+                buildFeatures {
+                  buildConfig = true
+                }
+                defaultConfig {
+                  resConfigs 'en', 'hi'
+                  buildConfigField 'String', 'GROQ_API_KEY', '"' + (System.getenv('GROQ_API_KEY') ?: '') + '"'
+                }
+                splits {
+                  abi {
+                    enable true
+                    reset()
+                    include 'arm64-v8a'
+                    universalApk false
+                  }
+                }
+                buildTypes {
+                  release {
+                    minifyEnabled true
+                    shrinkResources true
+                    proguardFiles getDefaultProguardFile('proguard-android-optimize.txt')
+                  }
+                }
+              }
+              def ksPath = System.getenv('KS_FILE')
+              def release = proj.android.buildTypes.getByName('release')
+              if (ksPath && new File(ksPath).exists()) {
+                def ci = proj.android.signingConfigs.create('ci')
+                ci.storeFile = new File(ksPath)
+                ci.storePassword = System.getenv('KS_PASS')
+                ci.keyAlias = System.getenv('KEY_ALIAS')
+                ci.keyPassword = System.getenv('KEY_PASS')
+                release.signingConfig = ci
+              } else {
+                release.signingConfig = proj.android.signingConfigs.getByName('debug')
+              }
+            }
+          }
+          EOF
+
+      - name: Build release APK
+        env:
+          KS_FILE: ${{ runner.temp }}/release.jks
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: ./gradlew assembleRelease -I "$RUNNER_TEMP/size.gradle" --stacktrace
+
+      - name: Show APK sizes
+        run: ls -lh app/build/outputs/apk/release/*.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: app-release
+          path: app/build/outputs/apk/release/*.apk
