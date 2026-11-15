@@ -28,6 +28,18 @@ jobs:
             echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
           fi
 
+      # Extra R8 rules (pdfbox-android / pdfium need these)
+      - name: Create extra R8 rules
+        run: |
+          cat > "$RUNNER_TEMP/extra-rules.pro" << 'EOF'
+          -dontwarn com.gemalto.jp2.**
+          -dontwarn org.bouncycastle.**
+          -dontwarn javax.annotation.**
+          -keep class com.tom_roush.pdfbox.** { *; }
+          -keep class com.tom_roush.harmony.** { *; }
+          -keep class com.shockwave.pdfium.** { *; }
+          EOF
+
       # Size reduction without editing build.gradle:
       # R8 minify + resource shrink, only en/hi languages, 64-bit (arm64) only
       - name: Create size optimization script
@@ -55,6 +67,7 @@ jobs:
                   release {
                     minifyEnabled true
                     proguardFiles getDefaultProguardFile('proguard-android-optimize.txt')
+                    proguardFiles new File(System.getenv('EXTRA_PRO'))
                   }
                 }
               }
@@ -92,6 +105,7 @@ jobs:
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASS: ${{ secrets.KEY_PASSWORD }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          EXTRA_PRO: ${{ runner.temp }}/extra-rules.pro
         run: ./gradlew assembleRelease -I "$RUNNER_TEMP/size.gradle" --stacktrace
 
       - name: Show APK sizes
