@@ -1,12 +1,14 @@
 package com.mycompany.pdfviewer;
 
 import android.content.Intent;
+import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.MediaStore;
 import android.provider.Settings;
 import android.text.Editable;
 import android.text.TextWatcher;
@@ -78,6 +80,7 @@ public class MainActivity extends AppCompatActivity {
     private final ExecutorService scanExecutor = Executors.newSingleThreadExecutor();
     private volatile boolean scanning = false;
     private long lastScanTime = 0;
+    private ToolsController toolsController;
     private boolean destroyed = false;
 
     private boolean rewardedReady = false;
@@ -93,6 +96,7 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        installCrashLogger();
         setContentView(R.layout.activity_main);
 
         Toolbar toolbar = findViewById(R.id.toolbar);
@@ -103,6 +107,8 @@ public class MainActivity extends AppCompatActivity {
         searchBox = findViewById(R.id.searchBox);
         bannerContainer = findViewById(R.id.bannerContainer);
         recyclerView.setLayoutManager(new LinearLayoutManager(this));
+        recyclerView.setHasFixedSize(true);
+        recyclerView.setItemViewCacheSize(20);
         recyclerView.setAdapter(new PdfAdapter());
 
         BottomNavigationView bottomNavigation = findViewById(R.id.bottomNavigation);
@@ -130,6 +136,9 @@ public class MainActivity extends AppCompatActivity {
             Toast.makeText(MainActivity.this, "Please open a PDF from the PDFs tab to edit it inside the viewer.", Toast.LENGTH_LONG).show()
         );
 
+        toolsController = new ToolsController(this, uri -> navigateToViewer(uri));
+        toolsController.attach(toolsSectionLayout);
+
         searchBox.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
             @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
@@ -140,6 +149,7 @@ public class MainActivity extends AppCompatActivity {
 
         initAds();
         checkStoragePermission();
+        showLastCrashIfAny();
 
         cachePrefs = getSharedPreferences("pdf_cache", MODE_PRIVATE);
         List<String[]> cached = loadCachedList();
@@ -152,7 +162,7 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onResume() {
         super.onResume();
-        if (hasStoragePermission() && !scanning && System.currentTimeMillis() - lastScanTime > 30000) scanDevice();
+        if (hasStoragePermission() && !scanning && System.currentTimeMillis() - lastScanTime > 120000) scanDevice();
     }
 
     private boolean hasStoragePermission() {
@@ -186,9 +196,42 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (toolsController != null && toolsController.onActivityResult(requestCode, resultCode, data)) return;
         if (requestCode == REQ_MANAGE_STORAGE && hasStoragePermission()) {
             scanDevice();
         }
+    }
+
+    // Saves the last crash stack trace so it can be shown on next launch (no logcat needed)
+    private void installCrashLogger() {
+        final Thread.UncaughtExceptionHandler old = Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
+            try {
+                java.io.StringWriter sw = new java.io.StringWriter();
+                e.printStackTrace(new java.io.PrintWriter(sw));
+                getSharedPreferences("crash_log", MODE_PRIVATE).edit()
+                        .putString("last", sw.toString()).commit();
+            } catch (Exception ignored) {}
+            if (old != null) old.uncaughtException(t, e);
+        });
+    }
+
+    private void showLastCrashIfAny() {
+        final android.content.SharedPreferences sp = getSharedPreferences("crash_log", MODE_PRIVATE);
+        final String last = sp.getString("last", null);
+        if (last == null) return;
+        sp.edit().remove("last").apply();
+        new androidx.appcompat.app.AlertDialog.Builder(this)
+                .setTitle("App crashed last time")
+                .setMessage(last.length() > 1500 ? last.substring(0, 1500) : last)
+                .setPositiveButton("Copy", (d, w) -> {
+                    android.content.ClipboardManager cm =
+                            (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                    cm.setPrimaryClip(android.content.ClipData.newPlainText("crash", last));
+                    Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("Close", null)
+                .show();
     }
 
     private void scanDevice() {
@@ -197,9 +240,14 @@ public class MainActivity extends AppCompatActivity {
         emptyText.setOnClickListener(null);
 
         scanExecutor.execute(() -> {
-            List<String[]> results = new ArrayList<>();
-            File root = Environment.getExternalStorageDirectory();
-            scanRecursive(root, 0, results);
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+            SimpleDateFormat sdf = new SimpleDateFormat("dd MMM yyyy", Locale.getDefault());
+            // Fast path: ask Android's media index. Slow folder walk only if that finds nothing.
+            List<String[]> results = queryPdfsFromMediaStore(sdf);
+            if (results.isEmpty()) {
+                File root = Environment.getExternalStorageDirectory();
+                scanRecursive(root, 0, results, sdf);
+            }
             Collections.sort(results, (a, b) -> Long.compare(Long.parseLong(b[3]), Long.parseLong(a[3])));
 
             if (destroyed) return;
@@ -242,15 +290,49 @@ public class MainActivity extends AppCompatActivity {
         } catch (Exception ignored) {}
     }
 
-    private void scanRecursive(File dir, int depth, List<String[]> results) {
+    private List<String[]> queryPdfsFromMediaStore(SimpleDateFormat sdf) {
+        List<String[]> list = new ArrayList<>();
+        String[] projection = {
+                MediaStore.Files.FileColumns.DATA,
+                MediaStore.Files.FileColumns.DISPLAY_NAME,
+                MediaStore.Files.FileColumns.DATE_MODIFIED
+        };
+        try (Cursor c = getContentResolver().query(
+                MediaStore.Files.getContentUri("external"),
+                projection,
+                MediaStore.Files.FileColumns.MIME_TYPE + "=?",
+                new String[]{"application/pdf"},
+                MediaStore.Files.FileColumns.DATE_MODIFIED + " DESC")) {
+            if (c == null) return list;
+            int iData = c.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DATA);
+            int iName = c.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DISPLAY_NAME);
+            int iMod = c.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DATE_MODIFIED);
+            while (c.moveToNext()) {
+                String path = c.getString(iData);
+                if (path == null) continue;
+                File f = new File(path);
+                if (!f.exists()) continue;
+                String name = c.getString(iName);
+                if (name == null) name = f.getName();
+                long modified = c.getLong(iMod) * 1000L;
+                list.add(new String[]{Uri.fromFile(f).toString(), name,
+                        sdf.format(new Date(modified)), String.valueOf(modified)});
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "MediaStore query failed: " + e.getMessage());
+        }
+        return list;
+    }
+
+    private void scanRecursive(File dir, int depth, List<String[]> results, SimpleDateFormat sdf) {
         if (dir == null || !dir.isDirectory() || depth > 12) return;
         File[] files = dir.listFiles();
         if (files == null) return;
-        SimpleDateFormat sdf = new SimpleDateFormat("dd MMM yyyy", Locale.getDefault());
         for (File f : files) {
             if (f.isDirectory()) {
                 if (f.isHidden()) continue;
-                scanRecursive(f, depth + 1, results);
+                if (depth == 0 && f.getName().equals("Android")) continue;
+                scanRecursive(f, depth + 1, results, sdf);
             } else if (f.getName().toLowerCase(Locale.ROOT).endsWith(".pdf")) {
                 String date = sdf.format(new Date(f.lastModified()));
                 results.add(new String[]{Uri.fromFile(f).toString(), f.getName(), date, String.valueOf(f.lastModified())});
@@ -470,6 +552,7 @@ public class MainActivity extends AppCompatActivity {
         adHandler.removeCallbacksAndMessages(null);
         mainHandler.removeCallbacksAndMessages(null);
         scanExecutor.shutdownNow();
+        if (toolsController != null) toolsController.destroy();
         if (bannerView != null) bannerView.destroy();
     }
 

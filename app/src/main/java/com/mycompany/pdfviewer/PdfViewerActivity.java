@@ -3,6 +3,8 @@ package com.mycompany.pdfviewer;
 import android.app.AlertDialog;
 import android.app.ProgressDialog;
 import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.RectF;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
@@ -10,6 +12,7 @@ import android.os.Looper;
 import android.text.InputType;
 import android.view.Menu;
 import android.view.MenuItem;
+import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.Toast;
@@ -21,7 +24,15 @@ import com.github.barteksc.pdfviewer.PDFView;
 import com.github.barteksc.pdfviewer.scroll.DefaultScrollHandle;
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader;
 import com.tom_roush.pdfbox.pdmodel.PDDocument;
+import com.tom_roush.pdfbox.pdmodel.PDPage;
+import com.tom_roush.pdfbox.pdmodel.common.PDRectangle;
+import com.tom_roush.pdfbox.pdmodel.graphics.color.PDColor;
+import com.tom_roush.pdfbox.pdmodel.graphics.color.PDDeviceRGB;
+import com.tom_roush.pdfbox.pdmodel.interactive.annotation.PDAnnotation;
+import com.tom_roush.pdfbox.pdmodel.interactive.annotation.PDAnnotationText;
+import com.tom_roush.pdfbox.pdmodel.interactive.annotation.PDAnnotationTextMarkup;
 import com.tom_roush.pdfbox.text.PDFTextStripper;
+import com.tom_roush.pdfbox.text.TextPosition;
 import com.unity3d.ads.IUnityAdsInitializationListener;
 import com.unity3d.ads.IUnityAdsLoadListener;
 import com.unity3d.ads.IUnityAdsShowListener;
@@ -35,7 +46,10 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
+import java.util.TreeSet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -58,11 +72,30 @@ public class PdfViewerActivity extends AppCompatActivity {
     private static final String GAME_ID = "800356656";
     private static final boolean TEST_MODE = false;
     private static final String REWARDED_PLACEMENT = "Rewarded_Android";
+    private static final String BANNER_PLACEMENT = "Banner_Android";
     private boolean rewardedReady = false;
+
+    // ---- In-PDF text search with highlight ----
+    private static class SearchMatch {
+        int page;
+        final java.util.List<android.graphics.RectF> rects = new java.util.ArrayList<>(); // 0..1 of page size
+    }
+    private java.util.List<SearchMatch> searchMatches = new java.util.ArrayList<>();
+    private int currentMatchIndex = -1;
+    private String lastQuery = "";
+    private final android.graphics.Paint hlPaint = new android.graphics.Paint();
+    private com.unity3d.services.banners.BannerView bannerView;
+    private android.widget.FrameLayout bannerContainer;
 
     // Groq key is injected at build time from GitHub Secrets (see build.yml). Never hardcode it here.
     private static final String GROQ_API_KEY = BuildConfig.GROQ_API_KEY;
-    private static final int MAX_AI_CHARS = 12000;
+    private static final int MAX_AI_CHARS = 6000; // free tier limit is ~8K tokens/min (Hindi uses many tokens)
+    // Groq free-tier models, strongest first. Next one is tried if a model is missing (404) or rate-limited (429).
+    private static final String[] GROQ_MODELS = {
+            "openai/gpt-oss-120b",
+            "qwen/qwen3.8-27b",
+            "openai/gpt-oss-20b"
+    };
 
     private static final OkHttpClient GROQ_CLIENT = new OkHttpClient.Builder()
             .connectTimeout(30, TimeUnit.SECONDS)
@@ -77,6 +110,7 @@ public class PdfViewerActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_pdf_viewer);
+        setupBannerContainer();
 
         PDFBoxResourceLoader.init(getApplicationContext());
 
@@ -89,7 +123,13 @@ public class PdfViewerActivity extends AppCompatActivity {
         Uri uri = resolveIncomingUri();
         if (uri != null) {
             currentUri = uri;
-            displayPdf(uri, 0);
+            docKey = Integer.toHexString(uri.toString().hashCode());
+            docName = PdfUtils.displayName(this, uri);
+            int startPage = vp().getInt("last_" + docKey, 0);
+            if (startPage > 0) {
+                Toast.makeText(this, "Continuing from page " + (startPage + 1), Toast.LENGTH_SHORT).show();
+            }
+            displayPdf(uri, startPage);
         } else {
             Toast.makeText(this, "No PDF to open", Toast.LENGTH_LONG).show();
         }
@@ -116,17 +156,26 @@ public class PdfViewerActivity extends AppCompatActivity {
                     .enableDoubletap(true)
                     .defaultPage(pageIndex)
                     .nightMode(isNightMode)
+                    .password(pdfPassword)
                     .enableAnnotationRendering(true)
                     .scrollHandle(new DefaultScrollHandle(this))
                     .enableAntialiasing(true)
+                    .onDrawAll((canvas, pw, ph, page) -> drawHighlights(canvas, pw, ph, page))
                     .onLoad(nbPages -> {
                         pageCount = nbPages;
                         setTitle((pageIndex + 1) + " / " + pageCount);
                     })
                     .onPageChange((page, totalCount) -> {
                         setTitle((page + 1) + " / " + totalCount);
+                        vp().edit().putInt("last_" + docKey, page).apply();
                     })
-                    .onError(t -> Toast.makeText(PdfViewerActivity.this, "Error loading PDF: " + t.getMessage(), Toast.LENGTH_LONG).show())
+                    .onError(t -> {
+                        if (t instanceof com.shockwave.pdfium.PdfPasswordException) {
+                            askPdfPassword(uri, pageIndex);
+                        } else {
+                            Toast.makeText(PdfViewerActivity.this, "Error loading PDF: " + t.getMessage(), Toast.LENGTH_LONG).show();
+                        }
+                    })
                     .load();
         } catch (Exception e) {
             Toast.makeText(this, "Failed to open PDF: " + e.getMessage(), Toast.LENGTH_LONG).show();
@@ -136,12 +185,61 @@ public class PdfViewerActivity extends AppCompatActivity {
     private void initRewardedAd() {
         if (!UnityAds.isInitialized()) {
             UnityAds.initialize(this, GAME_ID, TEST_MODE, new IUnityAdsInitializationListener() {
-                @Override public void onInitializationComplete() { loadRewardedAd(); }
+                @Override public void onInitializationComplete() {
+                    loadRewardedAd();
+                    runOnUiThread(() -> loadBanner());
+                }
                 @Override public void onInitializationFailed(UnityAds.UnityAdsInitializationError error, String message) {}
             });
         } else {
             loadRewardedAd();
+            loadBanner();
         }
+    }
+
+    // Puts a banner strip at the bottom of the viewer without touching activity_pdf_viewer.xml
+    private void setupBannerContainer() {
+        android.view.ViewGroup content = findViewById(android.R.id.content);
+        android.view.View root = content.getChildAt(0);
+        content.removeView(root);
+
+        LinearLayout wrapper = new LinearLayout(this);
+        wrapper.setOrientation(LinearLayout.VERTICAL);
+        wrapper.addView(root, new LinearLayout.LayoutParams(
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        bannerContainer = new android.widget.FrameLayout(this);
+        bannerContainer.setVisibility(android.view.View.GONE);
+        wrapper.addView(bannerContainer, new LinearLayout.LayoutParams(
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                android.view.ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        content.addView(wrapper, new android.view.ViewGroup.LayoutParams(
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT));
+    }
+
+    private void loadBanner() {
+        if (destroyed || bannerView != null || bannerContainer == null) return;
+        bannerView = new com.unity3d.services.banners.BannerView(
+                this, BANNER_PLACEMENT, new com.unity3d.services.banners.UnityBannerSize(320, 50));
+        bannerView.setListener(new com.unity3d.services.banners.BannerView.IListener() {
+            @Override public void onBannerLoaded(com.unity3d.services.banners.BannerView b) {
+                runOnUiThread(() -> { if (!destroyed) bannerContainer.setVisibility(android.view.View.VISIBLE); });
+            }
+            @Override public void onBannerShown(com.unity3d.services.banners.BannerView b) {}
+            @Override public void onBannerClick(com.unity3d.services.banners.BannerView b) {}
+            @Override public void onBannerFailedToLoad(com.unity3d.services.banners.BannerView b,
+                                                      com.unity3d.services.banners.BannerErrorInfo info) {
+                runOnUiThread(() -> { if (!destroyed) bannerContainer.setVisibility(android.view.View.GONE); });
+            }
+            @Override public void onBannerLeftApplication(com.unity3d.services.banners.BannerView b) {}
+        });
+        bannerContainer.addView(bannerView, new android.widget.FrameLayout.LayoutParams(
+                android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
+                android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
+                android.view.Gravity.CENTER_HORIZONTAL));
+        bannerView.load();
     }
 
     private void loadRewardedAd() {
@@ -154,6 +252,14 @@ public class PdfViewerActivity extends AppCompatActivity {
     @Override
     public boolean onCreateOptionsMenu(Menu menu) {
         getMenuInflater().inflate(R.menu.menu_viewer, menu);
+        menu.add(Menu.NONE, M_BOOKMARK, 100, "Bookmark this page");
+        menu.add(Menu.NONE, M_BOOKMARKS, 101, "My bookmarks");
+        menu.add(Menu.NONE, M_ANNOTATE, 102, "Highlight / Add note");
+        menu.add(Menu.NONE, M_OCR, 103, "OCR: read scanned page");
+        menu.add(Menu.NONE, M_CROP, 104, "Crop & share page");
+        menu.add(Menu.NONE, M_KEYPOINTS, 105, "AI: important points");
+        menu.add(Menu.NONE, M_QUIZ, 106, "AI: make MCQ quiz");
+        menu.add(Menu.NONE, M_SAVE_COPY, 107, "Save PDF copy to Downloads");
         return true;
     }
 
@@ -187,6 +293,24 @@ public class PdfViewerActivity extends AppCompatActivity {
             triggerAiWithAd(this::showEditPdfDialog);
             return true;
         }
+
+        if (id == M_BOOKMARK) { toggleBookmark(); return true; }
+        if (id == M_BOOKMARKS) { showBookmarks(); return true; }
+        if (id == M_ANNOTATE) { showAnnotateDialog(); return true; }
+        if (id == M_OCR) { runOcrPage(); return true; }
+        if (id == M_CROP) { startCropShare(); return true; }
+        if (id == M_KEYPOINTS) {
+            triggerAiWithAd(() -> requestAiTask("AI Key Points",
+                    "List the most important points of the following content as short bullet points. Reply in the same language as the text."));
+            return true;
+        }
+        if (id == M_QUIZ) {
+            triggerAiWithAd(() -> requestAiTask("AI Quiz",
+                    "Create 5 multiple-choice questions (MCQs) from the following content. Give 4 options (A-D) for each. "
+                    + "At the end write an answer key with a one-line explanation. Reply in the same language as the text."));
+            return true;
+        }
+        if (id == M_SAVE_COPY) { saveCopyToDownloads(); return true; }
 
         return super.onOptionsItemSelected(item);
     }
@@ -229,90 +353,36 @@ public class PdfViewerActivity extends AppCompatActivity {
         });
     }
 
-        private void requestAiSummary() {
-        final ProgressDialog progress = new ProgressDialog(this);
-        progress.setMessage("AI is summarizing content...");
-        progress.setCancelable(false);
-        progress.show();
-
-        final int currentPageNum = pdfView.getCurrentPage() + 1;
-        final Uri uri = currentUri;
-
-        backgroundExecutor.execute(() -> {
-            String result = null;
-            try (InputStream is = getContentResolver().openInputStream(uri)) {
-                if (is == null) throw new IOException("Cannot read PDF");
-                String extractedText;
-                PDDocument document = PDDocument.load(is);
-                try {
-                    PDFTextStripper stripper = new PDFTextStripper();
-                    stripper.setStartPage(currentPageNum);
-                    stripper.setEndPage(currentPageNum);
-                    extractedText = stripper.getText(document);
-                } finally {
-                    document.close();
-                }
-
-                if (extractedText == null || extractedText.trim().length() < 10) {
-                    result = "No readable text found on this page. It looks like a scanned image, so AI cannot read it.";
-                } else {
-                    if (extractedText.length() > MAX_AI_CHARS) {
-                        extractedText = extractedText.substring(0, MAX_AI_CHARS);
-                    }
-                    result = callGroqApi("Summarize the following page content clearly. "
-                            + "Reply in the same language as the text.\n\n" + extractedText);
-                }
-            } catch (Exception e) {
-                result = "Error: " + e.getMessage();
-            }
-
-            final String finalResult = result;
-            mainHandler.post(() -> {
-                if (destroyed) return;
-                progress.dismiss();
-                showResultDialog("AI Summary (Page " + currentPageNum + ")", finalResult);
-            });
-        });
+            private void requestAiSummary() {
+        requestAiTask("AI Summary",
+                "Summarize the following page content clearly. Reply in the same language as the text.");
     }
 
-        private void showPageLinesForSelection() {
+            private void showPageLinesForSelection() {
         final ProgressDialog progress = new ProgressDialog(this);
-        progress.setMessage("Extracting lines for selection...");
+        progress.setMessage("Reading page...");
         progress.setCancelable(false);
         progress.show();
 
-        final int currentPageNum = pdfView.getCurrentPage() + 1;
-        final Uri uri = currentUri;
+        final int pageNum = pdfView.getCurrentPage() + 1;
 
         backgroundExecutor.execute(() -> {
-            try (InputStream is = getContentResolver().openInputStream(uri)) {
-                if (is == null) throw new IOException("Cannot read PDF");
-                String pageText;
-                PDDocument document = PDDocument.load(is);
-                try {
-                    PDFTextStripper stripper = new PDFTextStripper();
-                    stripper.setStartPage(currentPageNum);
-                    stripper.setEndPage(currentPageNum);
-                    pageText = stripper.getText(document);
-                } finally {
-                    document.close();
-                }
-
-                final java.util.List<String> lineList = new java.util.ArrayList<>();
+            try {
+                String pageText = getPageTextWithOcr(pageNum - 1);
+                final List<String> lineList = new ArrayList<>();
                 for (String l : pageText.split("\\r?\\n")) {
                     if (!l.trim().isEmpty()) lineList.add(l.trim());
                 }
-
                 mainHandler.post(() -> {
                     if (destroyed) return;
                     progress.dismiss();
                     if (lineList.isEmpty()) {
-                        Toast.makeText(this, "No text found on this page. It may be a scanned image.", Toast.LENGTH_LONG).show();
+                        Toast.makeText(this, "No text found on this page.", Toast.LENGTH_LONG).show();
                         return;
                     }
                     final String[] lineArray = lineList.toArray(new String[0]);
                     new AlertDialog.Builder(this)
-                            .setTitle("Tap a line to explain (Page " + currentPageNum + ")")
+                            .setTitle("Tap a line to explain (Page " + pageNum + ")")
                             .setItems(lineArray, (dialog, which) -> requestAiExplanation(lineArray[which]))
                             .setNegativeButton("Cancel", null)
                             .show();
@@ -321,7 +391,7 @@ public class PdfViewerActivity extends AppCompatActivity {
                 mainHandler.post(() -> {
                     if (destroyed) return;
                     progress.dismiss();
-                    Toast.makeText(this, "Error extracting text: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                    Toast.makeText(this, "Error reading page: " + e.getMessage(), Toast.LENGTH_LONG).show();
                 });
             }
         });
@@ -349,9 +419,18 @@ public class PdfViewerActivity extends AppCompatActivity {
         if (GROQ_API_KEY == null || GROQ_API_KEY.isEmpty()) {
             return "AI key is missing in this build.";
         }
+        String result = "";
+        for (String model : GROQ_MODELS) {
+            result = callGroqModel(model, prompt);
+            if (!result.startsWith("AI error (HTTP 404") && !result.startsWith("AI error (HTTP 429")) return result;
+        }
+        return result;
+    }
+
+    private String callGroqModel(String model, String prompt) {
         try {
             JSONObject jsonBody = new JSONObject();
-            jsonBody.put("model", "llama-3.3-70b-versatile");
+            jsonBody.put("model", model);
 
             JSONArray messages = new JSONArray();
             JSONObject msg = new JSONObject();
@@ -398,12 +477,13 @@ public class PdfViewerActivity extends AppCompatActivity {
         }
     }
 
-        private void showResultDialog(String title, String message) {
+            private void showResultDialog(String title, String message) {
         if (destroyed || isFinishing()) return;
         new AlertDialog.Builder(this)
                 .setTitle(title)
                 .setMessage(message)
                 .setPositiveButton("OK", null)
+                .setNeutralButton("Copy", (d, w) -> copyToClipboard(message))
                 .show();
     }
 
@@ -424,18 +504,25 @@ public class PdfViewerActivity extends AppCompatActivity {
                 .show();
     }
 
-    private void showSearchDialog() {
+        private void showSearchDialog() {
         if (currentUri == null) return;
         EditText input = new EditText(this);
         input.setHint("Search text in this PDF");
+        input.setSingleLine(true);
+        input.setText(lastQuery);
+        input.setSelection(lastQuery.length());
         new AlertDialog.Builder(this)
-                .setTitle("Search in PDF")
+                .setTitle(searchMatches.isEmpty() ? "Search in PDF" : "Search / Next match")
                 .setView(input)
                 .setPositiveButton("Search", (dialog, which) -> {
-                    String query = input.getText().toString().trim();
-                    if (!query.isEmpty()) runTextSearch(query);
+                    String query = input.getText().toString().trim().replaceAll("\\s+", " ");
+                    if (query.isEmpty()) {
+                        clearSearchHighlights();
+                    } else {
+                        runTextSearch(query);
+                    }
                 })
-                .setNegativeButton("Cancel", null)
+                .setNegativeButton("Clear", (dialog, which) -> clearSearchHighlights())
                 .show();
     }
 
@@ -535,45 +622,174 @@ public class PdfViewerActivity extends AppCompatActivity {
         });
     }
 
-    private void runTextSearch(String query) {
+        private void runTextSearch(String query) {
+        // Same word searched again -> go to next match
+        if (!searchMatches.isEmpty() && query.equalsIgnoreCase(lastQuery)) {
+            currentMatchIndex = (currentMatchIndex + 1) % searchMatches.size();
+            goToCurrentMatch();
+            return;
+        }
+
         final ProgressDialog progress = new ProgressDialog(this);
         progress.setMessage("Searching...");
         progress.setCancelable(false);
         progress.show();
 
+        final Uri uri = currentUri;
         backgroundExecutor.execute(() -> {
-            Integer foundPage = null;
-            try (InputStream is = getContentResolver().openInputStream(currentUri)) {
+            final java.util.List<SearchMatch> found = new java.util.ArrayList<>();
+            try (InputStream is = getContentResolver().openInputStream(uri)) {
                 if (is == null) throw new IOException("Cannot open PDF");
                 PDDocument document = PDDocument.load(is);
                 try {
                     int total = document.getNumberOfPages();
-                    String lowerQuery = query.toLowerCase(Locale.getDefault());
-                    for (int i = 0; i < total; i++) {
-                        PDFTextStripper stripper = new PDFTextStripper();
-                        stripper.setStartPage(i + 1);
-                        stripper.setEndPage(i + 1);
-                        String pageText = stripper.getText(document);
-                        if (pageText != null && pageText.toLowerCase(Locale.getDefault()).contains(lowerQuery)) {
-                            foundPage = i;
-                            break;
-                        }
+                    for (int i = 0; i < total && found.size() < 300; i++) {
+                        MatchFinder finder = new MatchFinder();
+                        finder.setStartPage(i + 1);
+                        finder.setEndPage(i + 1);
+                        finder.getText(document);
+                        found.addAll(finder.findMatches(query, i));
                     }
                 } finally { document.close(); }
             } catch (Exception ignored) {}
 
-            final Integer resultPage = foundPage;
             mainHandler.post(() -> {
                 if (destroyed) return;
                 progress.dismiss();
-                if (resultPage != null) {
-                    pdfView.jumpTo(resultPage);
-                    Toast.makeText(PdfViewerActivity.this, "Found on page " + (resultPage + 1), Toast.LENGTH_SHORT).show();
-                } else {
+                if (found.isEmpty()) {
+                    clearSearchHighlights();
                     Toast.makeText(PdfViewerActivity.this, "Not found in this PDF", Toast.LENGTH_SHORT).show();
+                } else {
+                    lastQuery = query;
+                    searchMatches = found;
+                    currentMatchIndex = 0;
+                    goToCurrentMatch();
                 }
             });
         });
+    }
+
+    private void clearSearchHighlights() {
+        searchMatches = new java.util.ArrayList<>();
+        currentMatchIndex = -1;
+        lastQuery = "";
+        pdfView.invalidate();
+    }
+
+    // Jump to the page of the current match, scroll so the line is in the upper third, highlight it
+    private void goToCurrentMatch() {
+        if (currentMatchIndex < 0 || currentMatchIndex >= searchMatches.size()) return;
+        final SearchMatch m = searchMatches.get(currentMatchIndex);
+        final float topNorm = m.rects.isEmpty() ? 0f : m.rects.get(0).top;
+
+        pdfView.jumpTo(m.page, false);
+        pdfView.post(() -> {
+            if (destroyed) return;
+            try {
+                float pageH = pdfView.getPageSize(m.page).getHeight() * pdfView.getZoom();
+                float targetY = topNorm * pageH;
+                float wantedY = pdfView.getHeight() / 3f;
+                if (targetY > wantedY) {
+                    pdfView.moveRelativeTo(0, -(targetY - wantedY));
+                }
+            } catch (Exception ignored) {}
+            pdfView.invalidate();
+        });
+
+        Toast.makeText(this, "Match " + (currentMatchIndex + 1) + " of " + searchMatches.size()
+                + " (page " + (m.page + 1) + ")", Toast.LENGTH_SHORT).show();
+    }
+
+    private void drawHighlights(android.graphics.Canvas canvas, float pw, float ph, int page) {
+        if (searchMatches.isEmpty()) return;
+        for (int i = 0; i < searchMatches.size(); i++) {
+            SearchMatch m = searchMatches.get(i);
+            if (m.page != page) continue;
+            hlPaint.setColor(i == currentMatchIndex ? 0x99FF9800 : 0x66FFEB3B);
+            for (android.graphics.RectF r : m.rects) {
+                canvas.drawRect(r.left * pw, r.top * ph, r.right * pw, r.bottom * ph, hlPaint);
+            }
+        }
+    }
+
+    // Collects every character of a page with its position, then finds the query in it
+    private static class MatchFinder extends PDFTextStripper {
+        private final java.util.List<TextPosition> chars = new java.util.ArrayList<>(); // null = word break
+
+        MatchFinder() throws IOException { super(); }
+
+        @Override
+        protected void writeString(String text, java.util.List<TextPosition> positions) throws IOException {
+            chars.addAll(positions);
+            chars.add(null);
+        }
+
+        private static void appendSpace(StringBuilder sb, java.util.List<Integer> map, int idx) {
+            if (sb.length() == 0 || sb.charAt(sb.length() - 1) == ' ') return;
+            sb.append(' ');
+            map.add(idx);
+        }
+
+        java.util.List<SearchMatch> findMatches(String query, int pageIndex) {
+            java.util.List<SearchMatch> out = new java.util.ArrayList<>();
+            StringBuilder sb = new StringBuilder();
+            java.util.List<Integer> map = new java.util.ArrayList<>(); // text index -> chars index
+            for (int i = 0; i < chars.size(); i++) {
+                TextPosition tp = chars.get(i);
+                if (tp == null) {
+                    appendSpace(sb, map, i);
+                } else {
+                    String u = tp.getUnicode();
+                    if (u == null) continue;
+                    for (int k = 0; k < u.length(); k++) {
+                        char ch = u.charAt(k);
+                        if (Character.isWhitespace(ch)) {
+                            appendSpace(sb, map, i);
+                        } else {
+                            sb.append(ch);
+                            map.add(i);
+                        }
+                    }
+                }
+            }
+            String text = sb.toString();
+            int qLen = query.length();
+            int from = 0;
+            while (qLen > 0 && from + qLen <= text.length()) {
+                int idx = -1;
+                for (int p = from; p + qLen <= text.length(); p++) {
+                    if (text.regionMatches(true, p, query, 0, qLen)) { idx = p; break; }
+                }
+                if (idx < 0) break;
+                from = idx + qLen;
+
+                SearchMatch m = new SearchMatch();
+                m.page = pageIndex;
+                android.graphics.RectF cur = null;
+                for (int ci = map.get(idx); ci <= map.get(idx + qLen - 1); ci++) {
+                    TextPosition tp = chars.get(ci);
+                    if (tp == null) continue;
+                    float pw = tp.getPageWidth(), ph = tp.getPageHeight();
+                    if (pw <= 0 || ph <= 0) continue;
+                    float h = tp.getHeightDir();
+                    float left = tp.getXDirAdj();
+                    float top = tp.getYDirAdj() - h;
+                    android.graphics.RectF r = new android.graphics.RectF(
+                            left / pw, top / ph, (left + tp.getWidthDirAdj()) / pw, (top + h) / ph);
+                    if (cur == null) {
+                        cur = r;
+                    } else if (Math.abs(r.top - cur.top) < cur.height() * 0.5f && r.left >= cur.left - 0.02f) {
+                        cur.union(r);
+                    } else {
+                        m.rects.add(cur);
+                        cur = r;
+                    }
+                }
+                if (cur != null) m.rects.add(cur);
+                if (!m.rects.isEmpty()) out.add(m);
+            }
+            return out;
+        }
     }
 
     @Override
@@ -582,5 +798,433 @@ public class PdfViewerActivity extends AppCompatActivity {
         destroyed = true;
         mainHandler.removeCallbacksAndMessages(null);
         backgroundExecutor.shutdownNow();
+        if (bannerView != null) {
+            bannerView.destroy();
+            bannerView = null;
+        }
+    }
+
+
+    // =====================================================================
+    //  Extra features: bookmarks, annotate, OCR, crop & share, AI tasks
+    // =====================================================================
+    private static final int M_BOOKMARK = 9001, M_BOOKMARKS = 9002, M_ANNOTATE = 9003, M_OCR = 9004,
+            M_CROP = 9005, M_KEYPOINTS = 9006, M_QUIZ = 9007, M_SAVE_COPY = 9008;
+
+    private String docKey = "";
+    private String docName = "document";
+    private String pdfPassword = null;
+
+    private android.content.SharedPreferences vp() {
+        return getSharedPreferences("viewer_prefs", MODE_PRIVATE);
+    }
+
+    private void copyToClipboard(String text) {
+        android.content.ClipboardManager cm = (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        cm.setPrimaryClip(android.content.ClipData.newPlainText("text", text));
+        Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show();
+    }
+
+    // ---------- locked PDF ----------
+    private void askPdfPassword(final Uri uri, final int page) {
+        if (destroyed || isFinishing()) return;
+        final EditText in = new EditText(this);
+        in.setHint("Password");
+        in.setSingleLine(true);
+        in.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        new AlertDialog.Builder(this)
+                .setTitle("This PDF is locked")
+                .setView(in)
+                .setCancelable(false)
+                .setPositiveButton("Open", (d, w) -> {
+                    pdfPassword = in.getText().toString();
+                    displayPdf(uri, page);
+                })
+                .setNegativeButton("Cancel", (d, w) -> finish())
+                .show();
+    }
+
+    // ---------- bookmarks ----------
+    private TreeSet<Integer> loadBookmarks() {
+        TreeSet<Integer> set = new TreeSet<>();
+        String raw = vp().getString("bm_" + docKey, "");
+        for (String p : raw.split(",")) {
+            try { if (!p.trim().isEmpty()) set.add(Integer.parseInt(p.trim())); } catch (Exception ignored) {}
+        }
+        return set;
+    }
+
+    private void saveBookmarks(TreeSet<Integer> set) {
+        StringBuilder sb = new StringBuilder();
+        for (int p : set) { if (sb.length() > 0) sb.append(','); sb.append(p); }
+        vp().edit().putString("bm_" + docKey, sb.toString()).apply();
+    }
+
+    private void toggleBookmark() {
+        int page = pdfView.getCurrentPage();
+        TreeSet<Integer> set = loadBookmarks();
+        if (set.contains(page)) {
+            set.remove(page);
+            Toast.makeText(this, "Bookmark removed (page " + (page + 1) + ")", Toast.LENGTH_SHORT).show();
+        } else {
+            set.add(page);
+            Toast.makeText(this, "Page " + (page + 1) + " bookmarked", Toast.LENGTH_SHORT).show();
+        }
+        saveBookmarks(set);
+    }
+
+    private void showBookmarks() {
+        final TreeSet<Integer> set = loadBookmarks();
+        if (set.isEmpty()) {
+            Toast.makeText(this, "No bookmarks yet. Use \"Bookmark this page\".", Toast.LENGTH_LONG).show();
+            return;
+        }
+        final Integer[] pages = set.toArray(new Integer[0]);
+        String[] labels = new String[pages.length];
+        for (int i = 0; i < pages.length; i++) labels[i] = "Page " + (pages[i] + 1);
+        new AlertDialog.Builder(this)
+                .setTitle("My bookmarks")
+                .setItems(labels, (d, which) -> pdfView.jumpTo(pages[which], true))
+                .setNeutralButton("Clear all", (d, w) -> { saveBookmarks(new TreeSet<>()); })
+                .setNegativeButton("Close", null)
+                .show();
+    }
+
+    // ---------- page text (PDF text first, OCR if the page is a scan) ----------
+    private String extractPageText(int pageIndex) throws IOException {
+        try (InputStream is = getContentResolver().openInputStream(currentUri)) {
+            if (is == null) throw new IOException("Cannot read PDF");
+            PDDocument document = PDDocument.load(is);
+            try {
+                PDFTextStripper stripper = new PDFTextStripper();
+                stripper.setStartPage(pageIndex + 1);
+                stripper.setEndPage(pageIndex + 1);
+                return stripper.getText(document);
+            } finally {
+                document.close();
+            }
+        }
+    }
+
+    private String getPageTextWithOcr(int pageIndex) throws Exception {
+        String t = null;
+        try { t = extractPageText(pageIndex); } catch (Exception ignored) {}
+        if (t != null && t.trim().length() >= 10) return t;
+        Bitmap bmp = PdfUtils.renderPage(this, currentUri, pageIndex, 1600);
+        try {
+            return PdfUtils.ocr(bmp);
+        } finally {
+            bmp.recycle();
+        }
+    }
+
+    private void requestAiTask(final String title, final String instruction) {
+        final ProgressDialog progress = new ProgressDialog(this);
+        progress.setMessage("AI is working...");
+        progress.setCancelable(false);
+        progress.show();
+
+        final int pageIdx = pdfView.getCurrentPage();
+        backgroundExecutor.execute(() -> {
+            String result;
+            try {
+                String text = getPageTextWithOcr(pageIdx);
+                if (text == null || text.trim().length() < 10) {
+                    result = "No readable text found on this page.";
+                } else {
+                    if (text.length() > MAX_AI_CHARS) text = text.substring(0, MAX_AI_CHARS);
+                    result = callGroqApi(instruction + "\n\n" + text);
+                }
+            } catch (Exception e) {
+                result = "Error: " + e.getMessage();
+            }
+            final String finalResult = result;
+            mainHandler.post(() -> {
+                if (destroyed) return;
+                progress.dismiss();
+                showResultDialog(title + " (Page " + (pageIdx + 1) + ")", finalResult);
+            });
+        });
+    }
+
+    // ---------- OCR ----------
+    private void runOcrPage() {
+        final ProgressDialog progress = new ProgressDialog(this);
+        progress.setMessage("Reading page (OCR)...");
+        progress.setCancelable(false);
+        progress.show();
+
+        final int pageIdx = pdfView.getCurrentPage();
+        final Uri uri = currentUri;
+        backgroundExecutor.execute(() -> {
+            String result;
+            try {
+                Bitmap bmp = PdfUtils.renderPage(this, uri, pageIdx, 1600);
+                try {
+                    result = PdfUtils.ocr(bmp);
+                } finally {
+                    bmp.recycle();
+                }
+            } catch (Throwable e) {
+                result = "OCR failed: " + e.getMessage();
+            }
+            final String text = (result == null || result.trim().isEmpty()) ? "No text found on this page." : result;
+            mainHandler.post(() -> {
+                if (destroyed) return;
+                progress.dismiss();
+                new AlertDialog.Builder(this)
+                        .setTitle("OCR text (page " + (pageIdx + 1) + ")")
+                        .setMessage(text)
+                        .setPositiveButton("Copy", (d, w) -> copyToClipboard(text))
+                        .setNegativeButton("Close", null)
+                        .show();
+            });
+        });
+    }
+
+    // ---------- crop & share ----------
+    private void startCropShare() {
+        final ProgressDialog progress = new ProgressDialog(this);
+        progress.setMessage("Preparing page...");
+        progress.setCancelable(false);
+        progress.show();
+
+        final int pageIdx = pdfView.getCurrentPage();
+        final Uri uri = currentUri;
+        backgroundExecutor.execute(() -> {
+            Bitmap bmp = null;
+            String err = null;
+            try {
+                bmp = PdfUtils.renderPage(this, uri, pageIdx, 1600);
+            } catch (Throwable e) {
+                err = e.getMessage();
+            }
+            final Bitmap fb = bmp;
+            final String ferr = err;
+            mainHandler.post(() -> {
+                if (destroyed) return;
+                progress.dismiss();
+                if (fb == null) {
+                    Toast.makeText(this, "Cannot render page: " + ferr, Toast.LENGTH_LONG).show();
+                } else {
+                    showCropDialog(fb);
+                }
+            });
+        });
+    }
+
+    private void showCropDialog(final Bitmap bmp) {
+        final android.app.Dialog dialog = new android.app.Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen);
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+
+        final CropImageView cropView = new CropImageView(this);
+        cropView.setBitmap(bmp);
+        root.addView(cropView, new LinearLayout.LayoutParams(
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setPadding(16, 16, 16, 16);
+        Button cancel = new Button(this);
+        cancel.setText("Cancel");
+        Button share = new Button(this);
+        share.setText("Share");
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        bar.addView(cancel, blp);
+        bar.addView(share, blp);
+        root.addView(bar, new LinearLayout.LayoutParams(
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        cancel.setOnClickListener(v -> dialog.dismiss());
+        share.setOnClickListener(v -> {
+            final Bitmap cropped = cropView.getCroppedBitmap();
+            dialog.dismiss();
+            backgroundExecutor.execute(() -> {
+                try {
+                    final Uri u = PdfUtils.saveBitmapToPictures(this, cropped, "page_" + System.currentTimeMillis());
+                    mainHandler.post(() -> { if (!destroyed) shareImage(u); });
+                } catch (Exception e) {
+                    mainHandler.post(() -> { if (!destroyed) Toast.makeText(this, "Cannot save image: " + e.getMessage(), Toast.LENGTH_LONG).show(); });
+                }
+            });
+        });
+        dialog.setContentView(root);
+        dialog.show();
+    }
+
+    private void shareImage(Uri uri) {
+        Intent i = new Intent(Intent.ACTION_SEND);
+        i.setType("image/png");
+        i.putExtra(Intent.EXTRA_STREAM, uri);
+        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        startActivity(Intent.createChooser(i, "Share page image"));
+    }
+
+    // ---------- save copy ----------
+    private void saveCopyToDownloads() {
+        final Uri uri = currentUri;
+        backgroundExecutor.execute(() -> {
+            File tmp = new File(getCacheDir(), "copy_" + System.currentTimeMillis() + ".pdf");
+            String msg;
+            try (InputStream is = getContentResolver().openInputStream(uri);
+                 OutputStream os = new FileOutputStream(tmp)) {
+                if (is == null) throw new IOException("Cannot read PDF");
+                PdfUtils.copy(is, os);
+                PdfUtils.saveToDownloads(this, tmp, docName + "_copy.pdf", "application/pdf");
+                msg = "Saved in Downloads/" + PdfUtils.FOLDER + "/" + docName + "_copy.pdf";
+            } catch (Exception e) {
+                msg = "Save failed: " + e.getMessage();
+            } finally {
+                tmp.delete();
+            }
+            final String fm = msg;
+            mainHandler.post(() -> { if (!destroyed) Toast.makeText(this, fm, Toast.LENGTH_LONG).show(); });
+        });
+    }
+
+    // ---------- highlight / note saved inside the PDF ----------
+    private void showAnnotateDialog() {
+        final ProgressDialog progress = new ProgressDialog(this);
+        progress.setMessage("Reading page text...");
+        progress.setCancelable(false);
+        progress.show();
+
+        final int pageIdx = pdfView.getCurrentPage();
+        backgroundExecutor.execute(() -> {
+            String text = "";
+            try { text = extractPageText(pageIdx); } catch (Exception ignored) {}
+            final List<String> lines = new ArrayList<>();
+            for (String l : text.split("\\r?\\n")) {
+                if (!l.trim().isEmpty()) lines.add(l.trim());
+            }
+            mainHandler.post(() -> {
+                if (destroyed) return;
+                progress.dismiss();
+                if (lines.isEmpty()) {
+                    Toast.makeText(this, "No selectable text on this page (scanned). Use \"OCR\" instead.", Toast.LENGTH_LONG).show();
+                    return;
+                }
+                final String[] arr = lines.toArray(new String[0]);
+                new AlertDialog.Builder(this)
+                        .setTitle("Tap a line (Page " + (pageIdx + 1) + ")")
+                        .setItems(arr, (d, which) -> onLineChosen(pageIdx, arr[which]))
+                        .setNegativeButton("Cancel", null)
+                        .show();
+            });
+        });
+    }
+
+    private void onLineChosen(final int page, final String line) {
+        final String[] items = {"Yellow highlight", "Green highlight", "Pink highlight", "Blue highlight", "Add a note"};
+        new AlertDialog.Builder(this)
+                .setTitle("What to do with this line?")
+                .setItems(items, (d, which) -> {
+                    if (which < 4) applyAnnotation(page, line, which, null);
+                    else askNote(page, line);
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void askNote(final int page, final String line) {
+        final EditText in = new EditText(this);
+        in.setHint("Write your note");
+        in.setMinLines(3);
+        in.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+        new AlertDialog.Builder(this)
+                .setTitle("Note")
+                .setView(in)
+                .setPositiveButton("Save", (d, w) -> {
+                    String n = in.getText().toString().trim();
+                    if (!n.isEmpty()) applyAnnotation(page, line, -1, n);
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void applyAnnotation(final int page, final String line, final int colorIdx, final String note) {
+        final ProgressDialog progress = new ProgressDialog(this);
+        progress.setMessage("Saving to PDF...");
+        progress.setCancelable(false);
+        progress.show();
+
+        final Uri src = currentUri;
+        backgroundExecutor.execute(() -> {
+            final File out = new File(getCacheDir(), "annot_" + System.currentTimeMillis() + ".pdf");
+            String error = null;
+            try (InputStream is = getContentResolver().openInputStream(src)) {
+                if (is == null) throw new IOException("Cannot read PDF");
+                PDDocument doc = PDDocument.load(is);
+                try {
+                    PDPage pg = doc.getPage(page);
+                    if (pg.getRotation() != 0) throw new IOException("Rotated pages are not supported yet");
+
+                    MatchFinder f = new MatchFinder();
+                    f.setStartPage(page + 1);
+                    f.setEndPage(page + 1);
+                    f.getText(doc);
+                    List<SearchMatch> ms = f.findMatches(line.replaceAll("\\s+", " ").trim(), page);
+                    List<RectF> rects = ms.isEmpty() ? new ArrayList<RectF>() : ms.get(0).rects;
+
+                    PDRectangle box = pg.getCropBox();
+                    List<PDAnnotation> anns = pg.getAnnotations();
+
+                    if (colorIdx >= 0) {
+                        if (rects.isEmpty()) throw new IOException("Could not locate this line on the page");
+                        float[][] cols = {{1f, 0.92f, 0.23f}, {0.55f, 0.85f, 0.4f}, {1f, 0.6f, 0.8f}, {0.45f, 0.7f, 1f}};
+                        for (RectF r : rects) {
+                            float x1 = box.getLowerLeftX() + r.left * box.getWidth();
+                            float x2 = box.getLowerLeftX() + r.right * box.getWidth();
+                            float yTop = box.getUpperRightY() - r.top * box.getHeight();
+                            float yBot = box.getUpperRightY() - r.bottom * box.getHeight();
+                            PDAnnotationTextMarkup hl = new PDAnnotationTextMarkup(PDAnnotationTextMarkup.SUB_TYPE_HIGHLIGHT);
+                            hl.setRectangle(new PDRectangle(x1, yBot, x2 - x1, yTop - yBot));
+                            hl.setQuadPoints(new float[]{x1, yTop, x2, yTop, x1, yBot, x2, yBot});
+                            hl.setColor(new PDColor(cols[colorIdx], PDDeviceRGB.INSTANCE));
+                            anns.add(hl);
+                        }
+                    } else {
+                        float nx = box.getLowerLeftX() + 8f;
+                        float ny = box.getUpperRightY() - 28f;
+                        if (!rects.isEmpty()) {
+                            RectF r = rects.get(0);
+                            nx = Math.max(box.getLowerLeftX() + 4f, box.getLowerLeftX() + r.left * box.getWidth() - 26f);
+                            ny = box.getUpperRightY() - r.top * box.getHeight() - 20f;
+                        }
+                        PDAnnotationText t = new PDAnnotationText();
+                        t.setContents(note);
+                        t.setRectangle(new PDRectangle(nx, ny, 20f, 20f));
+                        t.setColor(new PDColor(new float[]{1f, 0.85f, 0f}, PDDeviceRGB.INSTANCE));
+                        anns.add(t);
+                    }
+                    pg.setAnnotations(anns);
+                    doc.save(out);
+                } finally {
+                    doc.close();
+                }
+            } catch (Throwable e) {
+                error = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+            }
+
+            final String ferr = error;
+            mainHandler.post(() -> {
+                if (destroyed) return;
+                progress.dismiss();
+                if (ferr != null) {
+                    out.delete();
+                    Toast.makeText(this, "Could not save: " + ferr, Toast.LENGTH_LONG).show();
+                    return;
+                }
+                // remove the previous annotated copy, show the new one
+                if ("file".equals(src.getScheme()) && src.getLastPathSegment() != null
+                        && src.getLastPathSegment().startsWith("annot_")) {
+                    new File(src.getPath()).delete();
+                }
+                currentUri = Uri.fromFile(out);
+                displayPdf(currentUri, pdfView.getCurrentPage());
+                Toast.makeText(this, "Saved in PDF. Use \"Save PDF copy\" to keep it in Downloads.", Toast.LENGTH_LONG).show();
+            });
+        });
     }
 }
