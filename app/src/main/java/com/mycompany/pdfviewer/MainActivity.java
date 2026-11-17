@@ -81,6 +81,10 @@ public class MainActivity extends AppCompatActivity {
     private volatile boolean scanning = false;
     private long lastScanTime = 0;
     private ToolsController toolsController;
+    private static final int ID_RECENT = 7001, ID_FAV = 7002;
+    private int listMode = 0; // 0 = all PDFs, 1 = recent, 2 = favorites
+    private android.content.SharedPreferences listPrefs;
+    private final java.util.Set<String> favSet = new java.util.HashSet<>();
     private boolean destroyed = false;
 
     private boolean rewardedReady = false;
@@ -116,12 +120,21 @@ public class MainActivity extends AppCompatActivity {
         final LinearLayout toolsSectionLayout = findViewById(R.id.toolsSectionLayout);
         MaterialCardView cardEditPdfTool = findViewById(R.id.cardEditPdfTool);
 
+        bottomNavigation.getMenu().add(Menu.NONE, ID_RECENT, Menu.NONE, "Recent")
+                .setIcon(android.R.drawable.ic_menu_recent_history);
+        bottomNavigation.getMenu().add(Menu.NONE, ID_FAV, Menu.NONE, "Favorites")
+                .setIcon(android.R.drawable.btn_star_big_on);
+
         bottomNavigation.setOnItemSelectedListener(item -> {
             int id = item.getItemId();
-            if (id == R.id.nav_pdfs) {
+            if (id == R.id.nav_pdfs || id == ID_RECENT || id == ID_FAV) {
+                listMode = id == ID_RECENT ? 1 : (id == ID_FAV ? 2 : 0);
                 pdfSectionLayout.setVisibility(View.VISIBLE);
                 toolsSectionLayout.setVisibility(View.GONE);
-                if (getSupportActionBar() != null) getSupportActionBar().setTitle("PDF Viewer");
+                if (getSupportActionBar() != null) {
+                    getSupportActionBar().setTitle(listMode == 1 ? "Recent" : (listMode == 2 ? "Favorites" : "PDF Viewer"));
+                }
+                filterList(searchBox.getText().toString());
                 return true;
             } else if (id == R.id.nav_tools) {
                 pdfSectionLayout.setVisibility(View.GONE);
@@ -152,6 +165,8 @@ public class MainActivity extends AppCompatActivity {
         showLastCrashIfAny();
 
         cachePrefs = getSharedPreferences("pdf_cache", MODE_PRIVATE);
+        listPrefs = getSharedPreferences("pdf_lists", MODE_PRIVATE);
+        favSet.addAll(listPrefs.getStringSet("fav", new java.util.HashSet<String>()));
         List<String[]> cached = loadCachedList();
         if (!cached.isEmpty()) {
             allPdfs = cached;
@@ -498,7 +513,15 @@ public class MainActivity extends AppCompatActivity {
 
     private void filterList(String query) {
         filteredPdfs.clear();
-        for (String[] item : allPdfs) {
+        List<String[]> source = new ArrayList<>();
+        if (listMode == 1) {
+            source = loadRecents();
+        } else if (listMode == 2) {
+            for (String[] it : allPdfs) if (favSet.contains(it[0])) source.add(it);
+        } else {
+            source = allPdfs;
+        }
+        for (String[] item : source) {
             if (item[1] != null && item[1].toLowerCase(Locale.getDefault())
                     .contains(query.toLowerCase(Locale.getDefault()))) {
                 filteredPdfs.add(item);
@@ -506,9 +529,15 @@ public class MainActivity extends AppCompatActivity {
         }
         if (hasStoragePermission()) {
             emptyText.setVisibility(filteredPdfs.isEmpty() ? View.VISIBLE : View.GONE);
-            emptyText.setText(allPdfs.isEmpty()
-                    ? (scanning ? "Scanning for PDFs..." : "No PDFs found on device.")
-                    : "No matching PDFs found.");
+            if (listMode == 1) {
+                emptyText.setText("No recent files yet.");
+            } else if (listMode == 2) {
+                emptyText.setText("No favorites yet. Long-press a PDF to add it.");
+            } else {
+                emptyText.setText(allPdfs.isEmpty()
+                        ? (scanning ? "Scanning for PDFs..." : "No PDFs found on device.")
+                        : "No matching PDFs found.");
+            }
         }
         if (recyclerView.getAdapter() != null) {
             recyclerView.getAdapter().notifyDataSetChanged();
@@ -531,6 +560,8 @@ public class MainActivity extends AppCompatActivity {
             @Override public void onUnityAdsShowClick(String placementId) {}
             @Override
             public void onUnityAdsShowComplete(String placementId, UnityAds.UnityAdsShowCompletionState state) {
+                getSharedPreferences("ad_prefs", MODE_PRIVATE).edit()
+                        .putLong("last_interstitial", System.currentTimeMillis()).apply();
                 navigateToViewer(uri);
                 interstitialReady = false;
                 interstitialRetryCount = 0;
@@ -539,7 +570,78 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
+    // ---------- favorites and recent files ----------
+    private void showItemMenu(final String[] item) {
+        final boolean fav = favSet.contains(item[0]);
+        final String[] options = {fav ? "Remove from favorites" : "Add to favorites", "Remove from recent"};
+        new androidx.appcompat.app.AlertDialog.Builder(this)
+                .setTitle(item[1])
+                .setItems(options, (d, which) -> {
+                    if (which == 0) {
+                        if (fav) favSet.remove(item[0]); else favSet.add(item[0]);
+                        listPrefs.edit().putStringSet("fav", new java.util.HashSet<>(favSet)).apply();
+                        Toast.makeText(this, fav ? "Removed from favorites" : "Added to favorites", Toast.LENGTH_SHORT).show();
+                    } else {
+                        removeRecent(item[0]);
+                    }
+                    filterList(searchBox.getText().toString());
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private List<String[]> loadRecents() {
+        List<String[]> list = new ArrayList<>();
+        try {
+            JSONArray arr = new JSONArray(listPrefs.getString("recent", "[]"));
+            for (int i = 0; i < arr.length(); i++) {
+                JSONArray o = arr.getJSONArray(i);
+                String uri = o.getString(0);
+                if (uri.startsWith("file:") && !new File(Uri.parse(uri).getPath()).exists()) continue;
+                list.add(new String[]{uri, o.getString(1), o.getString(2)});
+            }
+        } catch (Exception ignored) {}
+        return list;
+    }
+
+    private void saveRecents(List<String[]> list) {
+        JSONArray arr = new JSONArray();
+        for (String[] it : list) {
+            JSONArray o = new JSONArray();
+            o.put(it[0]);
+            o.put(it[1]);
+            o.put(it[2]);
+            arr.put(o);
+        }
+        listPrefs.edit().putString("recent", arr.toString()).apply();
+    }
+
+    private void addRecent(Uri uri) {
+        String name = null;
+        for (String[] it : allPdfs) {
+            if (it[0].equals(uri.toString())) { name = it[1]; break; }
+        }
+        if (name == null) name = PdfUtils.displayName(this, uri) + ".pdf";
+        String date = new SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(new Date());
+        List<String[]> list = loadRecents();
+        for (int i = list.size() - 1; i >= 0; i--) {
+            if (list.get(i)[0].equals(uri.toString())) list.remove(i);
+        }
+        list.add(0, new String[]{uri.toString(), name, date});
+        while (list.size() > 30) list.remove(list.size() - 1);
+        saveRecents(list);
+    }
+
+    private void removeRecent(String uri) {
+        List<String[]> list = loadRecents();
+        for (int i = list.size() - 1; i >= 0; i--) {
+            if (list.get(i)[0].equals(uri)) list.remove(i);
+        }
+        saveRecents(list);
+    }
+
     private void navigateToViewer(Uri uri) {
+        addRecent(uri);
         Intent intent = new Intent(this, PdfViewerActivity.class);
         intent.putExtra("pdf_uri", uri.toString());
         startActivity(intent);
@@ -567,9 +669,13 @@ public class MainActivity extends AppCompatActivity {
         @Override
         public void onBindViewHolder(@NonNull VH holder, int position) {
             String[] item = filteredPdfs.get(position);
-            holder.name.setText(item[1]);
+            holder.name.setText((favSet.contains(item[0]) ? "\u2605 " : "") + item[1]);
             holder.date.setText(item[2]);
             holder.itemView.setOnClickListener(v -> openViewer(Uri.parse(item[0])));
+            holder.itemView.setOnLongClickListener(v -> {
+                showItemMenu(item);
+                return true;
+            });
         }
 
         @Override

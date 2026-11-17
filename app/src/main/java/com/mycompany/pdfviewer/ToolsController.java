@@ -19,6 +19,9 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import com.google.android.material.card.MaterialCardView;
+import com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions;
+import com.google.mlkit.vision.documentscanner.GmsDocumentScanning;
+import com.google.mlkit.vision.documentscanner.GmsDocumentScanningResult;
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader;
 
 import java.io.File;
@@ -42,7 +45,7 @@ public class ToolsController {
     }
 
     private static final int REQ_MERGE = 501, REQ_SPLIT = 502, REQ_COMPRESS = 503, REQ_IMG2PDF = 504,
-            REQ_PDF2IMG = 505, REQ_LOCK = 506, REQ_UNLOCK = 507;
+            REQ_PDF2IMG = 505, REQ_LOCK = 506, REQ_UNLOCK = 507, REQ_SCAN = 508;
 
     private final Activity act;
     private final Opener opener;
@@ -66,7 +69,7 @@ public class ToolsController {
     }
 
     // ================= UI =================
-    public void attach(LinearLayout parent) {
+        public void attach(LinearLayout parent) {
         ScrollView sv = new ScrollView(act);
         LinearLayout col = new LinearLayout(act);
         col.setOrientation(LinearLayout.VERTICAL);
@@ -74,17 +77,17 @@ public class ToolsController {
         sv.addView(col, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         addRow(col,
-                card("\uD83D\uDD17", "Merge PDFs", "Join many PDFs into one", () -> pickPdf(REQ_MERGE, true)),
-                card("\u2702\uFE0F", "Split PDF", "Extract chosen pages", () -> pickPdf(REQ_SPLIT, false)));
+                card(ToolIconView.SCAN, 0xFF4F8DF7, "Scan Document", "Camera to PDF, auto crop", () -> startScan()),
+                card(ToolIconView.MERGE, 0xFF7C6CF0, "Merge PDFs", "Join many PDFs into one", () -> pickPdf(REQ_MERGE, true)));
         addRow(col,
-                card("\uD83D\uDDDC\uFE0F", "Compress PDF", "Make file size smaller", () -> pickPdf(REQ_COMPRESS, false)),
-                card("\uD83D\uDDBC\uFE0F", "Image to PDF", "Photos into one PDF", () -> pickImages(REQ_IMG2PDF)));
+                card(ToolIconView.SPLIT, 0xFFF29D38, "Split PDF", "Extract chosen pages", () -> pickPdf(REQ_SPLIT, false)),
+                card(ToolIconView.COMPRESS, 0xFF2FB47C, "Compress PDF", "Make file size smaller", () -> pickPdf(REQ_COMPRESS, false)));
         addRow(col,
-                card("\uD83D\uDCF7", "PDF to Image", "Save pages as pictures", () -> pickPdf(REQ_PDF2IMG, false)),
-                card("\uD83D\uDD12", "Lock PDF", "Add a password", () -> pickPdf(REQ_LOCK, false)));
+                card(ToolIconView.IMAGE_TO_PDF, 0xFFE9628C, "Image to PDF", "Photos into one PDF", () -> pickImages(REQ_IMG2PDF)),
+                card(ToolIconView.PDF_TO_IMAGE, 0xFF1FB5C9, "PDF to Image", "Save pages as pictures", () -> pickPdf(REQ_PDF2IMG, false)));
         addRow(col,
-                card("\uD83D\uDD13", "Unlock PDF", "Remove the password", () -> pickPdf(REQ_UNLOCK, false)),
-                null);
+                card(ToolIconView.LOCK, 0xFFE5A100, "Lock PDF", "Add a password", () -> pickPdf(REQ_LOCK, false)),
+                card(ToolIconView.UNLOCK, 0xFF8E9AAF, "Unlock PDF", "Remove the password", () -> pickPdf(REQ_UNLOCK, false)));
 
         parent.addView(sv, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
@@ -106,9 +109,9 @@ public class ToolsController {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
     }
 
-    private View card(String emoji, String title, String sub, Runnable click) {
+        private View card(int iconType, int color, String title, String sub, Runnable click) {
         MaterialCardView card = new MaterialCardView(act);
-        card.setRadius(dp(14));
+        card.setRadius(dp(16));
         card.setCardElevation(dp(2));
         card.setClickable(true);
         card.setFocusable(true);
@@ -119,10 +122,18 @@ public class ToolsController {
         in.setGravity(Gravity.CENTER_HORIZONTAL);
         in.setPadding(dp(10), dp(16), dp(10), dp(16));
 
-        TextView e = new TextView(act);
-        e.setText(emoji);
-        e.setTextSize(28);
-        e.setGravity(Gravity.CENTER);
+        // round tinted badge with the line icon inside
+        android.widget.FrameLayout badge = new android.widget.FrameLayout(act);
+        android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
+        bg.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+        bg.setColor((color & 0x00FFFFFF) | 0x2E000000);
+        badge.setBackground(bg);
+        ToolIconView icon = new ToolIconView(act, iconType, color);
+        android.widget.FrameLayout.LayoutParams ilp = new android.widget.FrameLayout.LayoutParams(dp(28), dp(28), Gravity.CENTER);
+        badge.addView(icon, ilp);
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(dp(56), dp(56));
+        blp.bottomMargin = dp(8);
+
         TextView t = new TextView(act);
         t.setText(title);
         t.setTextSize(15);
@@ -134,7 +145,7 @@ public class ToolsController {
         s.setAlpha(0.7f);
         s.setGravity(Gravity.CENTER);
 
-        in.addView(e);
+        in.addView(badge, blp);
         in.addView(t);
         in.addView(s);
         card.addView(in);
@@ -160,8 +171,13 @@ public class ToolsController {
 
     /** Call from Activity.onActivityResult. Returns true if the result belonged to the tools. */
     public boolean onActivityResult(int req, int res, Intent data) {
-        if (req < REQ_MERGE || req > REQ_UNLOCK) return false;
+        if (req < REQ_MERGE || req > REQ_SCAN) return false;
         if (res != Activity.RESULT_OK || data == null) return true;
+
+        if (req == REQ_SCAN) {
+            handleScanResult(data);
+            return true;
+        }
 
         final List<Uri> uris = new ArrayList<>();
         ClipData cd = data.getClipData();
@@ -182,6 +198,46 @@ public class ToolsController {
             case REQ_UNLOCK: doUnlock(uris.get(0)); break;
         }
         return true;
+    }
+
+    // ================= camera scanner =================
+    private void startScan() {
+        GmsDocumentScannerOptions options = new GmsDocumentScannerOptions.Builder()
+                .setGalleryImportAllowed(true)
+                .setPageLimit(25)
+                .setResultFormats(GmsDocumentScannerOptions.RESULT_FORMAT_PDF)
+                .setScannerMode(GmsDocumentScannerOptions.SCANNER_MODE_FULL)
+                .build();
+        GmsDocumentScanning.getClient(options)
+                .getStartScanIntent(act)
+                .addOnSuccessListener(sender -> {
+                    try {
+                        act.startIntentSenderForResult(sender, REQ_SCAN, null, 0, 0, 0);
+                    } catch (Exception e) {
+                        Toast.makeText(act, "Cannot start scanner: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                    }
+                })
+                .addOnFailureListener(e ->
+                        Toast.makeText(act, "Scanner needs Google Play services: " + e.getMessage(), Toast.LENGTH_LONG).show());
+    }
+
+    private void handleScanResult(Intent data) {
+        GmsDocumentScanningResult r = GmsDocumentScanningResult.fromActivityResultIntent(data);
+        if (r == null || r.getPdf() == null) {
+            Toast.makeText(act, "No scan received", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        final Uri pdf = r.getPdf().getUri();
+        final int pages = r.getPdf().getPageCount();
+        run("Saving scan...", () -> {
+            File out = tmp("scan");
+            try (java.io.InputStream in = act.getContentResolver().openInputStream(pdf);
+                 java.io.OutputStream os = new java.io.FileOutputStream(out)) {
+                if (in == null) throw new java.io.IOException("Cannot read scan");
+                PdfUtils.copy(in, os);
+            }
+            return savePdf(out, "scan_" + stamp() + ".pdf", "Scanned " + pages + " page(s).");
+        });
     }
 
     // ================= tools =================
