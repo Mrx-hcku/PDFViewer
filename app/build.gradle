@@ -43,4 +43,7 @@ dependencies {
 
     // OCR for scanned pages (reads Hindi + English, works offline)
     implementation 'com.google.mlkit:text-recognition-devanagari:16.0.1'
+
+    // Camera document scanner (auto crop, perspective fix, filters)
+    implementation 'com.google.android.gms:play-services-mlkit-document-scanner:16.0.0'
 }
