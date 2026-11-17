@@ -105,8 +105,21 @@ public final class PdfUtils {
     public static String ocr(Bitmap bmp) throws Exception {
         TextRecognizer rec = TextRecognition.getClient(new DevanagariTextRecognizerOptions.Builder().build());
         try {
-            Text t = Tasks.await(rec.process(InputImage.fromBitmap(bmp, 0)));
-            return t.getText();
+            // First use: Google Play services downloads the Hindi model, so retry for a short while.
+            Exception last = null;
+            for (int attempt = 0; attempt < 5; attempt++) {
+                try {
+                    Text t = Tasks.await(rec.process(InputImage.fromBitmap(bmp, 0)));
+                    return t.getText();
+                } catch (Exception e) {
+                    last = e;
+                    String m = String.valueOf(e.getMessage()).toLowerCase(Locale.ROOT);
+                    boolean waiting = m.contains("download") || m.contains("unavailable") || m.contains("module");
+                    if (!waiting) throw e;
+                    Thread.sleep(4000);
+                }
+            }
+            throw new IOException("Hindi OCR model is still downloading. Connect to the internet and try again in a minute.", last);
         } finally {
             rec.close();
         }
