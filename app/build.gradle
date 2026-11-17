@@ -8,7 +8,7 @@ android {
 
     defaultConfig {
         applicationId "com.mycompany.pdfviewer"
-        minSdk 21
+        minSdk 23
         targetSdk 34
         versionCode 1
         versionName "1.0"
@@ -41,8 +41,9 @@ dependencies {
     implementation 'com.github.mhiew:android-pdf-viewer:3.2.0-beta.3'
     implementation 'com.squareup.okhttp3:okhttp:4.12.0'
 
-    // OCR for scanned pages (reads Hindi + English, works offline)
-    implementation 'com.google.mlkit:text-recognition-devanagari:16.0.1'
+    // OCR for scanned pages (reads Hindi + English). Model is downloaded once by Google Play services,
+    // so it does not add to the APK size. Works offline after the first download.
+    implementation 'com.google.android.gms:play-services-mlkit-text-recognition-devanagari:16.0.1'
 
     // Camera document scanner (auto crop, perspective fix, filters)
     implementation 'com.google.android.gms:play-services-mlkit-document-scanner:16.0.0'
