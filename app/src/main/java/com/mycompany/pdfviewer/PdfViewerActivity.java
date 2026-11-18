@@ -122,6 +122,8 @@ public class PdfViewerActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_pdf_viewer);
+        installCrashLogger();
+        hidePageNumberBar();
         setupBannerContainer();
 
         PDFBoxResourceLoader.init(getApplicationContext());
@@ -174,6 +176,7 @@ public class PdfViewerActivity extends AppCompatActivity {
                     .enableAntialiasing(true)
                     .onDrawAll((canvas, pw, ph, page) -> drawHighlights(canvas, pw, ph, page))
                     .onLongPress(e -> onPdfLongPress(e))
+                    .onPageScroll((pg, off) -> lastScrollAt = android.os.SystemClock.uptimeMillis())
                     .onLoad(nbPages -> {
                         pageCount = nbPages;
                         setTitle((pageIndex + 1) + " / " + pageCount);
@@ -247,8 +250,59 @@ public class PdfViewerActivity extends AppCompatActivity {
     private void loadBanner() {
         if (bannerRequested || destroyed || bannerClosed) return;
         bannerRequested = true;
-        // wait until the first pages are drawn before creating the ad view
-        mainHandler.postDelayed(this::loadBannerNow, 2500);
+        // wait until the first pages are drawn, then until the reader has stopped scrolling
+        mainHandler.postDelayed(this::bannerIdleCheck, 2500);
+    }
+
+    private long lastScrollAt = 0;
+
+    private void bannerIdleCheck() {
+        if (destroyed || bannerClosed) return;
+        if (android.os.SystemClock.uptimeMillis() - lastScrollAt < 1500) {
+            mainHandler.postDelayed(this::bannerIdleCheck, 700);
+        } else {
+            loadBannerNow();
+        }
+    }
+
+    // The black "1/1" bar from the layout repeats the page number (already in the title) and wastes space
+    private void hidePageNumberBar() {
+        hidePageNumberIn(findViewById(android.R.id.content));
+    }
+
+    private void hidePageNumberIn(android.view.View v) {
+        if (v instanceof TextView) {
+            CharSequence t = ((TextView) v).getText();
+            if (t != null && t.toString().trim().matches("\\d+\\s*/\\s*\\d+")) {
+                v.setVisibility(android.view.View.GONE);
+                android.view.ViewParent p = v.getParent();
+                if (p instanceof android.view.ViewGroup && p != findViewById(android.R.id.content)) {
+                    android.view.ViewGroup g = (android.view.ViewGroup) p;
+                    boolean allGone = true;
+                    for (int i = 0; i < g.getChildCount(); i++) {
+                        if (g.getChildAt(i).getVisibility() != android.view.View.GONE) allGone = false;
+                    }
+                    if (allGone) g.setVisibility(android.view.View.GONE);
+                }
+            }
+        } else if (v instanceof android.view.ViewGroup) {
+            android.view.ViewGroup g = (android.view.ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) hidePageNumberIn(g.getChildAt(i));
+        }
+    }
+
+    // saves a crash report; it is shown the next time the app opens
+    private void installCrashLogger() {
+        final Thread.UncaughtExceptionHandler old = Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
+            try {
+                java.io.StringWriter sw = new java.io.StringWriter();
+                e.printStackTrace(new java.io.PrintWriter(sw));
+                getSharedPreferences("crash_log", MODE_PRIVATE).edit()
+                        .putString("last", sw.toString()).commit();
+            } catch (Exception ignored) {}
+            if (old != null) old.uncaughtException(t, e);
+        });
     }
 
     private void loadBannerNow() {
@@ -275,10 +329,10 @@ public class PdfViewerActivity extends AppCompatActivity {
         TextView close = new TextView(this);
         close.setText("\u2715");
         close.setTextColor(0xFFFFFFFF);
-        close.setTextSize(11);
+        close.setTextSize(9);
         close.setGravity(android.view.Gravity.CENTER);
-        close.setBackgroundColor(0x99000000);
-        int sz = dpPx(22);
+        close.setBackgroundColor(0x66000000);
+        int sz = dpPx(18);
         android.widget.FrameLayout.LayoutParams clp = new android.widget.FrameLayout.LayoutParams(
                 sz, sz, android.view.Gravity.TOP | android.view.Gravity.END);
         close.setOnClickListener(v -> {

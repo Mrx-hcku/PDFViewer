@@ -80,6 +80,8 @@ public class MainActivity extends AppCompatActivity {
     private final ExecutorService scanExecutor = Executors.newSingleThreadExecutor();
     private volatile boolean scanning = false;
     private long lastScanTime = 0;
+    private long lastScrollAt = 0;
+    private boolean bannerRequested = false;
     private ToolsController toolsController;
     private static final int ID_RECENT = 7001, ID_FAV = 7002;
     private int listMode = 0; // 0 = all PDFs, 1 = recent, 2 = favorites
@@ -110,20 +112,39 @@ public class MainActivity extends AppCompatActivity {
         emptyText = findViewById(R.id.emptyText);
         searchBox = findViewById(R.id.searchBox);
         bannerContainer = findViewById(R.id.bannerContainer);
+        // keep a fixed 50dp strip so the list is never resized when the ad arrives
+        android.view.ViewGroup.LayoutParams bcl = bannerContainer.getLayoutParams();
+        if (bcl != null) {
+            bcl.height = Math.round(50 * getResources().getDisplayMetrics().density);
+            bannerContainer.setLayoutParams(bcl);
+        }
+        bannerContainer.setVisibility(View.INVISIBLE);
         recyclerView.setLayoutManager(new LinearLayoutManager(this));
         recyclerView.setHasFixedSize(true);
         recyclerView.setItemViewCacheSize(20);
         recyclerView.setAdapter(new PdfAdapter());
+        recyclerView.addOnScrollListener(new RecyclerView.OnScrollListener() {
+            @Override
+            public void onScrolled(RecyclerView rv, int dx, int dy) {
+                lastScrollAt = android.os.SystemClock.uptimeMillis();
+            }
+        });
 
         BottomNavigationView bottomNavigation = findViewById(R.id.bottomNavigation);
         final LinearLayout pdfSectionLayout = findViewById(R.id.pdfSectionLayout);
         final LinearLayout toolsSectionLayout = findViewById(R.id.toolsSectionLayout);
         MaterialCardView cardEditPdfTool = findViewById(R.id.cardEditPdfTool);
 
-        bottomNavigation.getMenu().add(Menu.NONE, ID_RECENT, Menu.NONE, "Recent")
-                .setIcon(android.R.drawable.ic_menu_recent_history);
-        bottomNavigation.getMenu().add(Menu.NONE, ID_FAV, Menu.NONE, "Favorites")
-                .setIcon(android.R.drawable.btn_star_big_on);
+        // one consistent bar: same icon style, labels always visible, sensible order
+        Menu navMenu = bottomNavigation.getMenu();
+        navMenu.clear();
+        navMenu.add(Menu.NONE, R.id.nav_pdfs, 0, "PDFs").setIcon(NavIcons.make(this, NavIcons.PDFS));
+        navMenu.add(Menu.NONE, ID_RECENT, 1, "Recent").setIcon(NavIcons.make(this, NavIcons.RECENT));
+        navMenu.add(Menu.NONE, ID_FAV, 2, "Favorites").setIcon(NavIcons.make(this, NavIcons.FAVORITES));
+        navMenu.add(Menu.NONE, R.id.nav_tools, 3, "Tools").setIcon(NavIcons.make(this, NavIcons.TOOLS));
+        bottomNavigation.setLabelVisibilityMode(
+                com.google.android.material.navigation.NavigationBarView.LABEL_VISIBILITY_LABELED);
+        navMenu.findItem(R.id.nav_pdfs).setChecked(true);
 
         bottomNavigation.setOnItemSelectedListener(item -> {
             int id = item.getItemId();
@@ -387,6 +408,25 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void loadBanner() {
+        runOnUiThread(() -> {
+            if (bannerRequested || destroyed) return;
+            bannerRequested = true;
+            mainHandler.postDelayed(this::bannerIdleCheck, 1500);
+        });
+    }
+
+    // create the ad view only when the user is not scrolling
+    private void bannerIdleCheck() {
+        if (destroyed) return;
+        if (android.os.SystemClock.uptimeMillis() - lastScrollAt < 1500) {
+            mainHandler.postDelayed(this::bannerIdleCheck, 700);
+        } else {
+            loadBannerNow();
+        }
+    }
+
+    private void loadBannerNow() {
+        if (bannerView != null) return;
         bannerView = new BannerView(this, BANNER_PLACEMENT, new UnityBannerSize(320, 50));
         bannerView.setListener(new BannerView.IListener() {
             @Override
@@ -405,7 +445,9 @@ public class MainActivity extends AppCompatActivity {
 
             @Override public void onBannerLeftApplication(BannerView bannerAdView) {}
         });
-        bannerContainer.addView(bannerView);
+        float d = getResources().getDisplayMetrics().density;
+        bannerContainer.addView(bannerView, new FrameLayout.LayoutParams(
+                Math.round(320 * d), Math.round(50 * d), android.view.Gravity.CENTER_HORIZONTAL));
         bannerView.load();
     }
 
